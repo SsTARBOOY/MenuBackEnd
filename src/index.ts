@@ -7,27 +7,38 @@ import { pool } from "./db.js";
 
 const app = express();
 
-// ── Para poder usar __dirname en ESM ──────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-app.use(cors());
+// ==================== CORS CONFIG ====================
+app.use(
+  cors({
+    origin: [
+      "https://lapeñadesantiago.com",
+      "https://xn--lapeadesantiago-1qb.com",
+      "https://www.lapeñadesantiago.com",
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:3000",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+// =====================================================
+
 app.use(express.json());
 
-// ── Servir imágenes estáticas desde /uploads ──────────────────────────────────
-// Las imágenes en la DB tienen image_path = "/uploads/dishes/imagen.png"
-// El frontend las pide como: http://localhost:4000/uploads/dishes/imagen.png
 app.use(
   "/uploads",
   express.static(path.join(__dirname, "../../uploads"))
 );
 
-/** Health */
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-/** SOLO NOMBRES */
 app.get("/api/dishes", async (_req, res) => {
   try {
     const [rows] = await pool.query("SELECT id, name FROM dishes ORDER BY id DESC");
@@ -38,7 +49,6 @@ app.get("/api/dishes", async (_req, res) => {
   }
 });
 
-/** MENÚ COMPLETO con imagen */
 app.get("/api/menu", async (_req, res) => {
   try {
     const [rows] = await pool.query(`
@@ -53,7 +63,6 @@ app.get("/api/menu", async (_req, res) => {
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
     `);
-
     res.json(rows);
   } catch (error) {
     console.error(error);
@@ -61,7 +70,6 @@ app.get("/api/menu", async (_req, res) => {
   }
 });
 
-/** Products */
 app.get("/api/products", async (_req, res) => {
   try {
     const [rows] = await pool.query(
