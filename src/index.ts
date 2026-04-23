@@ -17,6 +17,7 @@ app.use(
       "https://lapeñadesantiago.com",
       "https://xn--lapeadesantiago-1qb.com",
       "https://www.lapeñadesantiago.com",
+      "https://www.xn--lapeadesantiago-1qb.com",
       "http://localhost:3000",
       "http://localhost:5173",
       "http://127.0.0.1:3000",
