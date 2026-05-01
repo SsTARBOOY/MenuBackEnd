@@ -1,0 +1,197 @@
+import express from "express";
+import cors from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
+import "dotenv/config";
+import mysql from "mysql2/promise";
+import { pool } from "./db.js";
+const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// ==================== CORS CONFIG ====================
+const ALLOWED_ORIGINS = [
+    "https://lapeñadesantiago.com",
+    "https://xn--lapeadesantiago-1qb.com",
+    "https://www.lapeñadesantiago.com",
+    "https://www.xn--lapeadesantiago-1qb.com",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+];
+if (process.env.CORS_EXTRA_ORIGINS) {
+    ALLOWED_ORIGINS.push(...process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()));
+}
+const corsOptions = {
+    origin(requestOrigin, callback) {
+        if (!requestOrigin)
+            return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(requestOrigin))
+            return callback(null, true);
+        callback(new Error(`CORS bloqueado: ${requestOrigin}`));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 200,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+// =====================================================
+app.use(express.json());
+// ── Imágenes estáticas — misma ruta que tenías originalmente ──────────────────
+app.use("/uploads", express.static(path.join(__dirname, "../../uploads")));
+// ==================== POOL DB USUARIOS ====================
+const usersPool = mysql.createPool({
+    host: process.env.USERS_DB_HOST ?? "localhost",
+    user: process.env.USERS_DB_USER ?? "",
+    password: process.env.USERS_DB_PASSWORD ?? "",
+    database: process.env.USERS_DB_NAME ?? "u522428285_lapena_db",
+    port: Number(process.env.USERS_DB_PORT ?? "3306"),
+    waitForConnections: true,
+    connectionLimit: 5,
+    connectTimeout: 15000,
+});
+// ── JWT ────────────────────────────────────────────────────────────────────────
+const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "lapena2026santiago_qro_secret_key_32x";
+import crypto from "crypto";
+function verifyToken(token) {
+    try {
+        const [header, payload, sig] = token.split(".");
+        if (!header || !payload || !sig)
+            return null;
+        const expected = crypto
+            .createHmac("sha256", TOKEN_SECRET)
+            .update(`${header}.${payload}`)
+            .digest("base64");
+        if (expected !== sig)
+            return null;
+        const data = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
+        if (!data || data.exp < Math.floor(Date.now() / 1000))
+            return null;
+        return data;
+    }
+    catch {
+        return null;
+    }
+}
+function getAuthUser(req, res) {
+    const auth = req.headers.authorization ?? "";
+    if (!auth.startsWith("Bearer ")) {
+        res.status(401).json({ ok: false, error: "No autorizado" });
+        return null;
+    }
+    const data = verifyToken(auth.slice(7));
+    if (!data) {
+        res.status(401).json({ ok: false, error: "Token inválido o expirado" });
+        return null;
+    }
+    return data;
+}
+// ── Health ─────────────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => {
+    res.json({ ok: true });
+});
+// ==================== GALLERY COMMENTS ====================
+app.get("/api/gallery-comments", async (_req, res) => {
+    try {
+        const [rows] = await usersPool.query(`
+      SELECT id, author, avatar, text, date_label AS date
+      FROM gallery_comments
+      ORDER BY created_at DESC
+      LIMIT 200
+    `);
+        res.json({ ok: true, data: rows });
+    }
+    catch (err) {
+        console.error("[gallery-comments GET]", err);
+        res.status(500).json({ ok: false, error: "Error al cargar comentarios" });
+    }
+});
+app.post("/api/gallery-comments", async (req, res) => {
+    const authData = getAuthUser(req, res);
+    if (!authData)
+        return;
+    const text = (req.body?.text ?? "").toString().trim();
+    if (!text || text.length > 500) {
+        res.status(422).json({ ok: false, error: "El comentario debe tener entre 1 y 500 caracteres" });
+        return;
+    }
+    try {
+        const [rows] = await usersPool.query("SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1", [authData.sub]);
+        const usuario = rows[0];
+        if (!usuario) {
+            res.status(404).json({ ok: false, error: "Usuario no encontrado" });
+            return;
+        }
+        const author = usuario.nombre;
+        const avatar = author.charAt(0).toUpperCase();
+        const dateLabel = new Date().toLocaleDateString("es-MX", {
+            day: "numeric", month: "short", year: "numeric",
+        });
+        const [result] = await usersPool.query(`INSERT INTO gallery_comments (usuario_id, author, avatar, text, date_label)
+       VALUES (?, ?, ?, ?, ?)`, [usuario.id, author, avatar, text, dateLabel]);
+        res.status(201).json({
+            ok: true,
+            data: {
+                id: String(result.insertId),
+                author,
+                avatar,
+                text,
+                date: dateLabel,
+            },
+        });
+    }
+    catch (err) {
+        console.error("[gallery-comments POST]", err);
+        res.status(500).json({ ok: false, error: "Error al guardar comentario" });
+    }
+});
+// ==========================================================
+app.get("/api/dishes", async (_req, res) => {
+    try {
+        const [rows] = await pool.query("SELECT id, name FROM dishes ORDER BY id DESC");
+        res.json(rows);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error leyendo dishes" });
+    }
+});
+// ── ÚNICO CAMBIO: quitado d.description que no existe en la tabla ─────────────
+app.get("/api/menu", async (_req, res) => {
+    try {
+        const [rows] = await pool.query(`
+      SELECT
+        d.id,
+        d.name,
+        d.price,
+        d.category_id,
+        d.image_path,
+        c.name AS category_name
+      FROM dishes d
+      LEFT JOIN categories c ON c.id = d.category_id
+      ORDER BY c.id, d.name
+    `);
+        res.json(rows);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error leyendo menú" });
+    }
+});
+app.get("/api/products", async (_req, res) => {
+    try {
+        const [rows] = await pool.query("SELECT id, name, price, category_id, image_path FROM products");
+        res.json(rows);
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: "Error leyendo productos" });
+    }
+});
+const PORT = Number(process.env.PORT ?? 4000);
+app.listen(PORT, () => {
+    console.log(`✅ API corriendo en http://localhost:${PORT}`);
+    console.log(`🖼️  Imágenes en   http://localhost:${PORT}/uploads/`);
+});

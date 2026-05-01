@@ -1,15 +1,10 @@
 import express from "express";
 import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
 import "dotenv/config";
 import mysql from "mysql2/promise";
 import { pool } from "./db.js";
 
 const app = express();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
 
 // ==================== CORS CONFIG ====================
 const ALLOWED_ORIGINS = [
@@ -45,18 +40,22 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json());
 
-app.use(
-  "/uploads",
-  express.static(path.join(__dirname, "../../uploads"))
-);
+
+// Base URL donde viven las imágenes (servidor Hostinger, no este container)
+const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
 
 // ==================== POOL DB USUARIOS ====================
-// Segunda conexión a la DB donde están usuarios y gallery_comments
+function mustEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Falta variable de entorno requerida: ${name}`);
+  return v;
+}
+
 const usersPool = mysql.createPool({
-  host:     process.env.USERS_DB_HOST     ?? "localhost",
-  user:     process.env.USERS_DB_USER     ?? "",
-  password: process.env.USERS_DB_PASSWORD ?? "",
-  database: process.env.USERS_DB_NAME     ?? "u522428285_lapena_db",
+  host:     mustEnv("USERS_DB_HOST"),
+  user:     mustEnv("USERS_DB_USER"),
+  password: mustEnv("USERS_DB_PASSWORD"),
+  database: mustEnv("USERS_DB_NAME"),
   port:     Number(process.env.USERS_DB_PORT ?? "3306"),
   waitForConnections: true,
   connectionLimit: 5,
@@ -64,7 +63,7 @@ const usersPool = mysql.createPool({
 });
 
 // ── Helpers JWT (mismo algoritmo que config.php) ──────────────
-const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "lapena2026santiago_qro_secret_key_32x";
+const TOKEN_SECRET = mustEnv("TOKEN_SECRET");
 import crypto from "crypto";
 
 function verifyToken(token: string): { sub: number; rol: string } | null {
@@ -105,6 +104,20 @@ app.get("/api/health", (_req, res) => {
 
 // ==================== GALLERY COMMENTS ====================
 
+// Rate limit: máximo 5 comentarios por usuario por hora
+const commentRateLimit = new Map<number, { count: number; resetAt: number }>();
+function checkCommentRateLimit(userId: number): boolean {
+  const now = Date.now();
+  const entry = commentRateLimit.get(userId);
+  if (!entry || now > entry.resetAt) {
+    commentRateLimit.set(userId, { count: 1, resetAt: now + 3_600_000 });
+    return true;
+  }
+  if (entry.count >= 5) return false;
+  entry.count++;
+  return true;
+}
+
 // GET — Leer comentarios (público)
 app.get("/api/gallery-comments", async (_req, res) => {
   try {
@@ -125,6 +138,11 @@ app.get("/api/gallery-comments", async (_req, res) => {
 app.post("/api/gallery-comments", async (req, res) => {
   const authData = getAuthUser(req, res);
   if (!authData) return;
+
+  if (!checkCommentRateLimit(authData.sub)) {
+    res.status(429).json({ ok: false, error: "Demasiados comentarios. Intenta más tarde." });
+    return;
+  }
 
   const text = (req.body?.text ?? "").toString().trim();
   if (!text || text.length > 500) {
@@ -197,8 +215,12 @@ app.get("/api/menu", async (_req, res) => {
       FROM dishes d
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
-    `);
-    res.json(rows);
+    `) as [Array<Record<string, unknown>>, unknown];
+    const data = rows.map(row => ({
+      ...row,
+      image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+    }));
+    res.json(data);
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Error leyendo menú" });
@@ -209,8 +231,12 @@ app.get("/api/products", async (_req, res) => {
   try {
     const [rows] = await pool.query(
       "SELECT id, name, price, category_id, image_path FROM products"
-    );
-    res.json(rows);
+    ) as [Array<Record<string, unknown>>, unknown];
+    const data = rows.map(row => ({
+      ...row,
+      image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+    }));
+    res.json(data);
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Error leyendo productos" });
