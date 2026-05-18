@@ -40,31 +40,39 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json());
 
-
 // Base URL donde viven las imágenes (servidor Hostinger, no este container)
 const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
 
 // ==================== POOL DB USUARIOS ====================
-function mustEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Falta variable de entorno requerida: ${name}`);
-  return v;
+import crypto from "crypto";
+
+const USERS_DB_CONFIGURED = !!(
+  process.env.USERS_DB_HOST &&
+  process.env.USERS_DB_USER &&
+  process.env.USERS_DB_PASSWORD &&
+  process.env.USERS_DB_NAME &&
+  process.env.TOKEN_SECRET
+);
+
+const usersPool = USERS_DB_CONFIGURED
+  ? mysql.createPool({
+      host:     process.env.USERS_DB_HOST!,
+      user:     process.env.USERS_DB_USER!,
+      password: process.env.USERS_DB_PASSWORD!,
+      database: process.env.USERS_DB_NAME!,
+      port:     Number(process.env.USERS_DB_PORT ?? "3306"),
+      waitForConnections: true,
+      connectionLimit: 5,
+      connectTimeout: 15000,
+    })
+  : null;
+
+if (!USERS_DB_CONFIGURED) {
+  console.warn("⚠️  USERS_DB / TOKEN_SECRET no configurados — comentarios y reseñas deshabilitados");
 }
 
-const usersPool = mysql.createPool({
-  host:     mustEnv("USERS_DB_HOST"),
-  user:     mustEnv("USERS_DB_USER"),
-  password: mustEnv("USERS_DB_PASSWORD"),
-  database: mustEnv("USERS_DB_NAME"),
-  port:     Number(process.env.USERS_DB_PORT ?? "3306"),
-  waitForConnections: true,
-  connectionLimit: 5,
-  connectTimeout: 15000,
-});
-
-// ── Helpers JWT (mismo algoritmo que config.php) ──────────────
-const TOKEN_SECRET = mustEnv("TOKEN_SECRET");
-import crypto from "crypto";
+// ── Helpers JWT ──────────────────────────────────────────────
+const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "";
 
 function verifyToken(token: string): { sub: number; rol: string } | null {
   try {
@@ -83,7 +91,10 @@ function verifyToken(token: string): { sub: number; rol: string } | null {
   }
 }
 
-function getAuthUser(req: express.Request, res: express.Response): { sub: number; rol: string } | null {
+function getAuthUser(
+  req: express.Request,
+  res: express.Response
+): { sub: number; rol: string } | null {
   const auth = req.headers.authorization ?? "";
   if (!auth.startsWith("Bearer ")) {
     res.status(401).json({ ok: false, error: "No autorizado" });
@@ -104,7 +115,6 @@ app.get("/api/health", (_req, res) => {
 
 // ==================== GALLERY COMMENTS ====================
 
-// Rate limit: máximo 5 comentarios por usuario por hora
 const commentRateLimit = new Map<number, { count: number; resetAt: number }>();
 function checkCommentRateLimit(userId: number): boolean {
   const now = Date.now();
@@ -118,8 +128,8 @@ function checkCommentRateLimit(userId: number): boolean {
   return true;
 }
 
-// GET — Leer comentarios (público)
 app.get("/api/gallery-comments", async (_req, res) => {
+  if (!usersPool) { res.json({ ok: true, data: [] }); return; }
   try {
     const [rows] = await usersPool.query(`
       SELECT id, author, avatar, text, date_label AS date
@@ -134,8 +144,11 @@ app.get("/api/gallery-comments", async (_req, res) => {
   }
 });
 
-// POST — Crear comentario (requiere token JWT)
 app.post("/api/gallery-comments", async (req, res) => {
+  if (!usersPool) {
+    res.status(503).json({ ok: false, error: "Comentarios no disponibles en este entorno" });
+    return;
+  }
   const authData = getAuthUser(req, res);
   if (!authData) return;
 
@@ -151,20 +164,16 @@ app.post("/api/gallery-comments", async (req, res) => {
   }
 
   try {
-    // Obtener nombre real del usuario
     const [rows] = await usersPool.query(
       "SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1",
       [authData.sub]
     ) as [Array<{ id: number; nombre: string }>, unknown];
 
     const usuario = rows[0];
-    if (!usuario) {
-      res.status(404).json({ ok: false, error: "Usuario no encontrado" });
-      return;
-    }
+    if (!usuario) { res.status(404).json({ ok: false, error: "Usuario no encontrado" }); return; }
 
-    const author = usuario.nombre;
-    const avatar = author.charAt(0).toUpperCase();
+    const author    = usuario.nombre;
+    const avatar    = author.charAt(0).toUpperCase();
     const dateLabel = new Date().toLocaleDateString("es-MX", {
       day: "numeric", month: "short", year: "numeric",
     });
@@ -177,17 +186,144 @@ app.post("/api/gallery-comments", async (req, res) => {
 
     res.status(201).json({
       ok: true,
-      data: {
-        id:     String(result.insertId),
-        author,
-        avatar,
-        text,
-        date:   dateLabel,
-      },
+      data: { id: String(result.insertId), author, avatar, text, date: dateLabel },
     });
   } catch (err) {
     console.error("[gallery-comments POST]", err);
     res.status(500).json({ ok: false, error: "Error al guardar comentario" });
+  }
+});
+// ==========================================================
+
+// ==================== REVIEWS ============================
+
+const reviewRateLimit = new Map<number, { count: number; resetAt: number }>();
+function checkReviewRateLimit(userId: number): boolean {
+  const now = Date.now();
+  const entry = reviewRateLimit.get(userId);
+  if (!entry || now > entry.resetAt) {
+    reviewRateLimit.set(userId, { count: 1, resetAt: now + 3_600_000 });
+    return true;
+  }
+  if (entry.count >= 3) return false;
+  entry.count++;
+  return true;
+}
+
+// GET /api/reviews?sucursal=guerrero|madero  — público
+app.get("/api/reviews", async (req, res) => {
+  if (!usersPool) { res.json({ ok: true, data: [] }); return; }
+
+  const sucursal = (req.query.sucursal as string) ?? "";
+  if (!["guerrero", "madero"].includes(sucursal)) {
+    res.status(400).json({ ok: false, error: 'Parámetro sucursal inválido. Usa "guerrero" o "madero"' });
+    return;
+  }
+
+  try {
+    const [rows] = await usersPool.query(
+      `SELECT
+         id,
+         author,
+         avatar,
+         rating,
+         comment,
+         dish,
+         sucursal,
+         verified,
+         DATE_FORMAT(created_at, '%Y-%m-%d') AS date
+       FROM reviews
+       WHERE sucursal = ?
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [sucursal]
+    ) as [Array<{
+      id: number; author: string; avatar: string; rating: number;
+      comment: string; dish: string | null; sucursal: string;
+      verified: number; date: string;
+    }>, unknown];
+
+    const data = rows.map(r => ({
+      ...r,
+      id:       String(r.id),
+      verified: Boolean(r.verified),
+    }));
+
+    res.json({ ok: true, data });
+  } catch (err) {
+    console.error("[reviews GET]", err);
+    res.status(500).json({ ok: false, error: "Error al cargar reseñas" });
+  }
+});
+
+// POST /api/reviews  — requiere JWT
+app.post("/api/reviews", async (req, res) => {
+  if (!usersPool) {
+    res.status(503).json({ ok: false, error: "Reseñas no disponibles en este entorno" });
+    return;
+  }
+
+  const authData = getAuthUser(req, res);
+  if (!authData) return;
+
+  if (!checkReviewRateLimit(authData.sub)) {
+    res.status(429).json({ ok: false, error: "Demasiadas reseñas. Intenta más tarde." });
+    return;
+  }
+
+  const rating   = Number(req.body?.rating   ?? 0);
+  const comment  = (req.body?.comment  ?? "").toString().trim();
+  const dish     = (req.body?.dish     ?? "").toString().trim();
+  const sucursal = (req.body?.sucursal ?? "").toString().trim();
+
+  if (rating < 1 || rating > 5) {
+    res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" });
+    return;
+  }
+  if (comment.length < 10 || comment.length > 1000) {
+    res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" });
+    return;
+  }
+  if (!["guerrero", "madero"].includes(sucursal)) {
+    res.status(422).json({ ok: false, error: "Sucursal inválida" });
+    return;
+  }
+
+  try {
+    const [rows] = await usersPool.query(
+      "SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1",
+      [authData.sub]
+    ) as [Array<{ id: number; nombre: string }>, unknown];
+
+    const usuario = rows[0];
+    if (!usuario) { res.status(404).json({ ok: false, error: "Usuario no encontrado" }); return; }
+
+    const author = usuario.nombre;
+    const avatar = author.charAt(0).toUpperCase();
+
+    const [result] = await usersPool.query(
+      `INSERT INTO reviews (usuario_id, author, avatar, rating, comment, dish, sucursal, verified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+      [usuario.id, author, avatar, rating, comment, dish || null, sucursal]
+    ) as [mysql.ResultSetHeader, unknown];
+
+    res.status(201).json({
+      ok: true,
+      data: {
+        id:       String(result.insertId),
+        author,
+        avatar,
+        rating,
+        comment,
+        dish:     dish || null,
+        sucursal,
+        verified: false,
+        date:     new Date().toISOString().split("T")[0],
+      },
+    });
+  } catch (err) {
+    console.error("[reviews POST]", err);
+    res.status(500).json({ ok: false, error: "Error al guardar reseña" });
   }
 });
 // ==========================================================
