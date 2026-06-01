@@ -160,11 +160,13 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     try {
       const { crearCfdi } = await import("../services/facturama.service.js");
       const order = (orderRows as any[])[0];
-      const fecha = new Date(order.order_date ?? order.created_at).toISOString().slice(0, 19);
+
+      // ⚠️ Siempre usar fecha actual — el SAT no permite timbrar con más de 72h de antigüedad
+      const fechaTimbrado = new Date().toISOString().slice(0, 19);
 
       const cfdi = await crearCfdi({
         folio:         String(orderId).padStart(6, "0"),
-        fecha,
+        fecha:         fechaTimbrado,
         paymentMethod: order.payment_method,
         receiver: {
           rfc:           rfc.toUpperCase(),
@@ -192,7 +194,6 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       });
 
     } catch (factuErr: any) {
-      // Si Facturama falla, la solicitud queda en 'pendiente' para revisión manual
       console.error("[facturas] timbrado automático falló:", factuErr?.message);
       res.status(201).json({
         success: true, solicitudId,
@@ -224,15 +225,18 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
       "SELECT * FROM factura_requests WHERE id = ? AND status = 'pendiente' LIMIT 1",
       [solicitudId]
     ) as [Array<Record<string, any>>, unknown];
-    if (!solRows?.length) { res.status(404).json({ error: "Solicitud no encontrada o ya procesada." }); return; }
+    if (!solRows?.length) {
+      res.status(404).json({ error: "Solicitud no encontrada o ya procesada." }); return;
+    }
     const sol = solRows[0];
 
     const [orderRows] = await pool.query(
       `SELECT id, order_date, created_at, payment_method, total, tax, total_with_tax
        FROM orders WHERE id = ? LIMIT 1`, [sol.order_id]
     ) as [Array<Record<string, any>>, unknown];
-    if (!orderRows?.length) { res.status(404).json({ error: "Orden no encontrada." }); return; }
-    const order = orderRows[0];
+    if (!orderRows?.length) {
+      res.status(404).json({ error: "Orden no encontrada." }); return;
+    }
 
     const [itemRows] = await pool.query(
       `SELECT item_name, quantity, price AS subtotal,
@@ -242,19 +246,27 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
     ) as [Array<Record<string, any>>, unknown];
 
     const { crearCfdi } = await import("../services/facturama.service.js");
-    const fecha = new Date(order.order_date ?? order.created_at).toISOString().slice(0, 19);
+
+    // ⚠️ Siempre usar fecha actual — el SAT no permite timbrar con más de 72h de antigüedad
+    const fechaTimbrado = new Date().toISOString().slice(0, 19);
+    const order = (orderRows as any[])[0];
 
     const result = await crearCfdi({
-      folio: String(sol.order_id).padStart(6, "0"),
-      fecha,
+      folio:         String(sol.order_id).padStart(6, "0"),
+      fecha:         fechaTimbrado,
       paymentMethod: order.payment_method,
       receiver: {
-        rfc: sol.rfc, razonSocial: sol.razon_social,
-        regimenFiscal: sol.regimen_fiscal, codigoPostal: sol.codigo_postal, usoCfdi: sol.uso_cfdi,
+        rfc:           sol.rfc,
+        razonSocial:   sol.razon_social,
+        regimenFiscal: sol.regimen_fiscal,
+        codigoPostal:  sol.codigo_postal,
+        usoCfdi:       sol.uso_cfdi,
       },
       items: (itemRows as any[]).map(i => ({
-        dishName: i.item_name, quantity: Number(i.quantity),
-        unitPrice: Number(i.unit_price), subtotal: Number(i.subtotal),
+        dishName:  i.item_name,
+        quantity:  Number(i.quantity),
+        unitPrice: Number(i.unit_price),
+        subtotal:  Number(i.subtotal),
       })),
       email: sol.email,
     });
@@ -264,8 +276,13 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
       [`CFDI: ${result.uuid} | ID: ${result.cfdiId}`, solicitudId]
     );
 
-    res.json({ success: true, uuid: result.uuid, cfdiId: result.cfdiId,
-               message: `Factura timbrada y enviada a ${sol.email}` });
+    res.json({
+      success:  true,
+      uuid:     result.uuid,
+      cfdiId:   result.cfdiId,
+      message:  `Factura timbrada y enviada a ${sol.email}`,
+    });
+
   } catch (err: any) {
     console.error("[facturas] timbrarFactura error:", err);
     res.status(500).json({ error: err?.message ?? "Error al timbrar." });
