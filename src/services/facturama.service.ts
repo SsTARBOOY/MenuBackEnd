@@ -95,7 +95,8 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   const body: Record<string, unknown> = {
     NameId: "1",
     Folio: data.folio,
-    Date: new Date().toISOString().slice(0, 19), PaymentForm: mapPaymentForm(data.paymentMethod),
+    Date: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19),
+    PaymentForm: mapPaymentForm(data.paymentMethod),
     PaymentMethod: "PUE",
     ExpeditionPlace: process.env.FACTURAMA_CP ?? "76000",
     CfdiType: "I",
@@ -119,9 +120,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
 
   // ── 1. Crear CFDI ─────────────────────────────────────────────
   // Endpoint correcto según docs: POST /3/cfdis
-  console.log("[Facturama] Date enviado:", body.Date);
-console.log("[Facturama] Body:", JSON.stringify(body));
-const createRes = await fetch(`${API_URL}/3/cfdis`, {
+  const createRes = await fetch(`${API_URL}/3/cfdis`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
