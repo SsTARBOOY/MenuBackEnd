@@ -165,7 +165,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       const fechaTimbrado = new Date().toISOString().slice(0, 19);
 
       const cfdi = await crearCfdi({
-        folio:         String(orderId).padStart(6, "0"),
+        folio: `${String(orderId).padStart(6, "0")}-${Date.now()}`,
         fecha:         fechaTimbrado,
         paymentMethod: order.payment_method,
         receiver: {
