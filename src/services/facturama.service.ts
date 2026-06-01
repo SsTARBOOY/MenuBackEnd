@@ -119,7 +119,9 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
 
   // ── 1. Crear CFDI ─────────────────────────────────────────────
   // Endpoint correcto según docs: POST /3/cfdis
-  const createRes = await fetch(`${API_URL}/3/cfdis`, {
+  console.log("[Facturama] Date enviado:", body.Date);
+console.log("[Facturama] Body:", JSON.stringify(body));
+const createRes = await fetch(`${API_URL}/3/cfdis`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
