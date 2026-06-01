@@ -2,7 +2,9 @@
 // ─────────────────────────────────────────────────────────────────
 //  La Peña de Santiago · Integración Facturama API Web
 //  Docs: https://apisandbox.facturama.mx/Docs
-//  Endpoints API Web (sin /api/3/): /Cfdi, /Client, etc.
+//  Crear:    POST  /3/cfdis
+//  Descargar: GET  /Cfdi/{format}/issued/{id}
+//  Email:    POST  /cfdi?CfdiType=issued&CfdiId={id}&Email={email}
 // ─────────────────────────────────────────────────────────────────
 
 const API_URL = (process.env.FACTURAMA_URL ?? "https://api.facturama.mx").replace(/\/$/, "");
@@ -117,8 +119,8 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   };
 
   // ── 1. Crear CFDI ─────────────────────────────────────────────
-  // API Web usa /Cfdi (PascalCase, sin /api/3/)
-  const createRes = await fetch(`${API_URL}/Cfdi`, {
+  // Endpoint correcto según docs: POST /3/cfdis
+  const createRes = await fetch(`${API_URL}/3/cfdis`, {
     method:  "POST",
     headers: {
       "Content-Type":  "application/json",
@@ -133,18 +135,22 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   }
 
   const cfdi = await createRes.json() as {
-    
-    Id: string;
-    Folio: string;
+    Id:       string;
+    Folio:    string;
     Complement?: { TaxStamp?: { Uuid?: string } };
   };
-console.log("[Facturama] CFDI response:", JSON.stringify(cfdi, null, 2));
+
+  console.log("[Facturama] CFDI creado:", JSON.stringify({
+    Id:     cfdi.Id,
+    Folio:  cfdi.Folio,
+    Uuid:   cfdi.Complement?.TaxStamp?.Uuid,
+  }));
 
   const cfdiId = cfdi.Id;
   const uuid   = cfdi.Complement?.TaxStamp?.Uuid ?? "";
 
   // ── 2. Descargar PDF ──────────────────────────────────────────
-  // Formato: /Cfdi/pdf/issued/{id}
+  // Endpoint: GET /Cfdi/pdf/issued/{id}
   const pdfRes = await fetch(
     `${API_URL}/Cfdi/pdf/issued/${cfdiId}`,
     { headers: { "Authorization": getAuth() } }
@@ -154,7 +160,7 @@ console.log("[Facturama] CFDI response:", JSON.stringify(cfdi, null, 2));
     : "";
 
   // ── 3. Descargar XML ──────────────────────────────────────────
-  // Formato: /Cfdi/xml/issued/{id}
+  // Endpoint: GET /Cfdi/xml/issued/{id}
   const xmlRes = await fetch(
     `${API_URL}/Cfdi/xml/issued/${cfdiId}`,
     { headers: { "Authorization": getAuth() } }
@@ -164,18 +170,19 @@ console.log("[Facturama] CFDI response:", JSON.stringify(cfdi, null, 2));
     : "";
 
   // ── 4. Enviar por email ───────────────────────────────────────
-  await fetch(`${API_URL}/Cfdi/email`, {
+  // Endpoint: POST /cfdi?CfdiType=issued&CfdiId={id}&Email={email}
+  // Los parámetros van en la URL (query params), NO en el body
+  const emailUrl = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(data.email)}`;
+  const emailRes = await fetch(emailUrl, {
     method:  "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": getAuth(),
-    },
-    body: JSON.stringify({
-      cfdiType: "issued",
-      cfdiId,
-      email:    data.email,
-    }),
+    headers: { "Authorization": getAuth() },
   });
+
+  if (!emailRes.ok) {
+    const emailErr = await emailRes.text();
+    console.warn("[Facturama] Email warning:", emailErr);
+    // No lanzar error — el CFDI ya fue timbrado, el email es secundario
+  }
 
   return {
     cfdiId,
