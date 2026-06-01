@@ -17,42 +17,42 @@ const getAuth = () => {
 
 const mapPaymentForm = (method: string | null): string => {
   const m = (method ?? "").toLowerCase();
-  if (m.includes("efectivo") || m.includes("cash"))       return "01";
-  if (m.includes("tarjeta") && m.includes("créd"))        return "04";
-  if (m.includes("tarjeta") && m.includes("déb"))         return "28";
+  if (m.includes("efectivo") || m.includes("cash")) return "01";
+  if (m.includes("tarjeta") && m.includes("créd")) return "04";
+  if (m.includes("tarjeta") && m.includes("déb")) return "28";
   if (m.includes("transferencia") || m.includes("trans")) return "03";
   return "01";
 };
 
 // ── Interfaces ──────────────────────────────────────────────────
 export interface CfdiItem {
-  dishName:  string;
-  quantity:  number;
+  dishName: string;
+  quantity: number;
   unitPrice: number;
-  subtotal:  number;
+  subtotal: number;
 }
 
 export interface CfdiReceiver {
-  rfc:           string;
-  razonSocial:   string;
+  rfc: string;
+  razonSocial: string;
   regimenFiscal: string;
-  codigoPostal:  string;
-  usoCfdi:       string;
+  codigoPostal: string;
+  usoCfdi: string;
 }
 
 export interface CfdiRequest {
-  folio:         string;
-  fecha:         string;
+  folio: string;
+  fecha: string;
   paymentMethod: string | null;
-  receiver:      CfdiReceiver;
-  items:         CfdiItem[];
-  email:         string;
+  receiver: CfdiReceiver;
+  items: CfdiItem[];
+  email: string;
 }
 
 export interface CfdiResult {
-  cfdiId:    string;
-  uuid:      string;
-  folio:     string;
+  cfdiId: string;
+  uuid: string;
+  folio: string;
   pdfBase64: string;
   xmlBase64: string;
 }
@@ -61,27 +61,27 @@ export interface CfdiResult {
 export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   const items = data.items.map((it, idx) => {
     const unitPrice = Number(it.unitPrice.toFixed(6));
-    const subtotal  = Number(it.subtotal.toFixed(2));
-    const ivaBase   = subtotal;
-    const ivaTotal  = Number((ivaBase * 0.16).toFixed(2));
-    const total     = Number((subtotal + ivaTotal).toFixed(2));
+    const subtotal = Number(it.subtotal.toFixed(2));
+    const ivaBase = subtotal;
+    const ivaTotal = Number((ivaBase * 0.16).toFixed(2));
+    const total = Number((subtotal + ivaTotal).toFixed(2));
 
     return {
-      ProductCode:          "90101500",
+      ProductCode: "90101500",
       IdentificationNumber: String(idx + 1).padStart(3, "0"),
-      Description:          it.dishName,
-      Unit:                 "Pieza",
-      UnitCode:             "H87",
-      UnitPrice:            unitPrice,
-      Quantity:             it.quantity,
-      Subtotal:             subtotal,
-      TaxObject:            "02",
+      Description: it.dishName,
+      Unit: "Pieza",
+      UnitCode: "H87",
+      UnitPrice: unitPrice,
+      Quantity: it.quantity,
+      Subtotal: subtotal,
+      TaxObject: "02",
       Taxes: [
         {
-          Total:       ivaTotal,
-          Name:        "IVA",
-          Base:        ivaBase,
-          Rate:        0.16,
+          Total: ivaTotal,
+          Name: "IVA",
+          Base: ivaBase,
+          Rate: 0.16,
           IsRetention: false,
         },
       ],
@@ -93,27 +93,26 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   const now = new Date();
 
   const body: Record<string, unknown> = {
-    NameId:          "1",
-    Folio:           data.folio,
-    Date: new Date().toISOString().slice(0, 19),
-    PaymentForm:     mapPaymentForm(data.paymentMethod),
-    PaymentMethod:   "PUE",
+    NameId: "1",
+    Folio: data.folio,
+    Date: new Date().toISOString().slice(0, 19), PaymentForm: mapPaymentForm(data.paymentMethod),
+    PaymentMethod: "PUE",
     ExpeditionPlace: process.env.FACTURAMA_CP ?? "76000",
-    CfdiType:        "I",
-    Currency:        "MXN",
+    CfdiType: "I",
+    Currency: "MXN",
     ...(isPublico ? {
       GlobalInformation: {
         Periodicity: "04",
-        Months:      String(now.getMonth() + 1).padStart(2, "0"),
-        Year:        String(now.getFullYear()),
+        Months: String(now.getMonth() + 1).padStart(2, "0"),
+        Year: String(now.getFullYear()),
       }
     } : {}),
     Receiver: {
-      Rfc:          data.receiver.rfc.toUpperCase(),
-      Name:         data.receiver.razonSocial.trim(),
-      CfdiUse:      data.receiver.usoCfdi,
+      Rfc: data.receiver.rfc.toUpperCase(),
+      Name: data.receiver.razonSocial.trim(),
+      CfdiUse: data.receiver.usoCfdi,
       FiscalRegime: data.receiver.regimenFiscal,
-      TaxZipCode:   data.receiver.codigoPostal,
+      TaxZipCode: data.receiver.codigoPostal,
     },
     Items: items,
   };
@@ -121,9 +120,9 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   // ── 1. Crear CFDI ─────────────────────────────────────────────
   // Endpoint correcto según docs: POST /3/cfdis
   const createRes = await fetch(`${API_URL}/3/cfdis`, {
-    method:  "POST",
+    method: "POST",
     headers: {
-      "Content-Type":  "application/json",
+      "Content-Type": "application/json",
       "Authorization": getAuth(),
     },
     body: JSON.stringify(body),
@@ -135,19 +134,19 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   }
 
   const cfdi = await createRes.json() as {
-    Id:       string;
-    Folio:    string;
+    Id: string;
+    Folio: string;
     Complement?: { TaxStamp?: { Uuid?: string } };
   };
 
   console.log("[Facturama] CFDI creado:", JSON.stringify({
-    Id:     cfdi.Id,
-    Folio:  cfdi.Folio,
-    Uuid:   cfdi.Complement?.TaxStamp?.Uuid,
+    Id: cfdi.Id,
+    Folio: cfdi.Folio,
+    Uuid: cfdi.Complement?.TaxStamp?.Uuid,
   }));
 
   const cfdiId = cfdi.Id;
-  const uuid   = cfdi.Complement?.TaxStamp?.Uuid ?? "";
+  const uuid = cfdi.Complement?.TaxStamp?.Uuid ?? "";
 
   // ── 2. Descargar PDF ──────────────────────────────────────────
   // Endpoint: GET /Cfdi/pdf/issued/{id}
@@ -174,7 +173,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   // Los parámetros van en la URL (query params), NO en el body
   const emailUrl = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(data.email)}`;
   const emailRes = await fetch(emailUrl, {
-    method:  "POST",
+    method: "POST",
     headers: { "Authorization": getAuth() },
   });
 
@@ -187,7 +186,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   return {
     cfdiId,
     uuid,
-    folio:     cfdi.Folio,
+    folio: cfdi.Folio,
     pdfBase64: pdfData,
     xmlBase64: xmlData,
   };
