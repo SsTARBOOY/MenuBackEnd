@@ -67,7 +67,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     const total     = Number((subtotal + ivaTotal).toFixed(2));
 
     return {
-      ProductCode:           "90101500",        // Servicios de restaurante (SAT)
+      ProductCode:           "90101500",
       IdentificationNumber:  String(idx + 1).padStart(3, "0"),
       Description:           it.dishName,
       Unit:                  "Pieza",
@@ -75,7 +75,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
       UnitPrice:             unitPrice,
       Quantity:              it.quantity,
       Subtotal:              subtotal,
-      Discount:              0,
+      TaxObject:             "02",
       Taxes: [
         {
           Total:       ivaTotal,
