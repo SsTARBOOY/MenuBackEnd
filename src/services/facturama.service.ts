@@ -4,7 +4,7 @@
 //  Docs: https://api.facturama.mx/docs
 // ─────────────────────────────────────────────────────────────────
 
-const API_URL = "https://api.facturama.mx";
+const API_URL = (process.env.FACTURAMA_URL ?? "https://api.facturama.mx").replace(/\/$/, "");
 
 // Credenciales vienen del .env
 const getAuth = () => {
