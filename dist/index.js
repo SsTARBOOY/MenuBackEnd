@@ -1,13 +1,9 @@
 import express from "express";
 import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
 import "dotenv/config";
 import mysql from "mysql2/promise";
 import { pool } from "./db.js";
 const app = express();
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 // ==================== CORS CONFIG ====================
 const ALLOWED_ORIGINS = [
     "https://lapeñadesantiago.com",
@@ -39,22 +35,32 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 // =====================================================
 app.use(express.json());
-// ── Imágenes estáticas — misma ruta que tenías originalmente ──────────────────
-app.use("/uploads", express.static(path.join(__dirname, "../../uploads")));
+// Base URL donde viven las imágenes (servidor Hostinger, no este container)
+const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
 // ==================== POOL DB USUARIOS ====================
-const usersPool = mysql.createPool({
-    host: process.env.USERS_DB_HOST ?? "localhost",
-    user: process.env.USERS_DB_USER ?? "",
-    password: process.env.USERS_DB_PASSWORD ?? "",
-    database: process.env.USERS_DB_NAME ?? "u522428285_lapena_db",
-    port: Number(process.env.USERS_DB_PORT ?? "3306"),
-    waitForConnections: true,
-    connectionLimit: 5,
-    connectTimeout: 15000,
-});
-// ── JWT ────────────────────────────────────────────────────────────────────────
-const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "lapena2026santiago_qro_secret_key_32x";
 import crypto from "crypto";
+const USERS_DB_CONFIGURED = !!(process.env.USERS_DB_HOST &&
+    process.env.USERS_DB_USER &&
+    process.env.USERS_DB_PASSWORD &&
+    process.env.USERS_DB_NAME &&
+    process.env.TOKEN_SECRET);
+const usersPool = USERS_DB_CONFIGURED
+    ? mysql.createPool({
+        host: process.env.USERS_DB_HOST,
+        user: process.env.USERS_DB_USER,
+        password: process.env.USERS_DB_PASSWORD,
+        database: process.env.USERS_DB_NAME,
+        port: Number(process.env.USERS_DB_PORT ?? "3306"),
+        waitForConnections: true,
+        connectionLimit: 5,
+        connectTimeout: 15000,
+    })
+    : null;
+if (!USERS_DB_CONFIGURED) {
+    console.warn("⚠️  USERS_DB / TOKEN_SECRET no configurados — comentarios y reseñas deshabilitados");
+}
+// ── Helpers JWT ──────────────────────────────────────────────
+const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "";
 function verifyToken(token) {
     try {
         const [header, payload, sig] = token.split(".");
@@ -88,12 +94,29 @@ function getAuthUser(req, res) {
     }
     return data;
 }
-// ── Health ─────────────────────────────────────────────────────────────────────
+// =============================================================
 app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
 });
 // ==================== GALLERY COMMENTS ====================
+const commentRateLimit = new Map();
+function checkCommentRateLimit(userId) {
+    const now = Date.now();
+    const entry = commentRateLimit.get(userId);
+    if (!entry || now > entry.resetAt) {
+        commentRateLimit.set(userId, { count: 1, resetAt: now + 3_600_000 });
+        return true;
+    }
+    if (entry.count >= 5)
+        return false;
+    entry.count++;
+    return true;
+}
 app.get("/api/gallery-comments", async (_req, res) => {
+    if (!usersPool) {
+        res.json({ ok: true, data: [] });
+        return;
+    }
     try {
         const [rows] = await usersPool.query(`
       SELECT id, author, avatar, text, date_label AS date
@@ -109,9 +132,17 @@ app.get("/api/gallery-comments", async (_req, res) => {
     }
 });
 app.post("/api/gallery-comments", async (req, res) => {
+    if (!usersPool) {
+        res.status(503).json({ ok: false, error: "Comentarios no disponibles en este entorno" });
+        return;
+    }
     const authData = getAuthUser(req, res);
     if (!authData)
         return;
+    if (!checkCommentRateLimit(authData.sub)) {
+        res.status(429).json({ ok: false, error: "Demasiados comentarios. Intenta más tarde." });
+        return;
+    }
     const text = (req.body?.text ?? "").toString().trim();
     if (!text || text.length > 500) {
         res.status(422).json({ ok: false, error: "El comentario debe tener entre 1 y 500 caracteres" });
@@ -133,18 +164,125 @@ app.post("/api/gallery-comments", async (req, res) => {
        VALUES (?, ?, ?, ?, ?)`, [usuario.id, author, avatar, text, dateLabel]);
         res.status(201).json({
             ok: true,
-            data: {
-                id: String(result.insertId),
-                author,
-                avatar,
-                text,
-                date: dateLabel,
-            },
+            data: { id: String(result.insertId), author, avatar, text, date: dateLabel },
         });
     }
     catch (err) {
         console.error("[gallery-comments POST]", err);
         res.status(500).json({ ok: false, error: "Error al guardar comentario" });
+    }
+});
+// ==========================================================
+// ==================== REVIEWS ============================
+const reviewRateLimit = new Map();
+function checkReviewRateLimit(userId) {
+    const now = Date.now();
+    const entry = reviewRateLimit.get(userId);
+    if (!entry || now > entry.resetAt) {
+        reviewRateLimit.set(userId, { count: 1, resetAt: now + 3_600_000 });
+        return true;
+    }
+    if (entry.count >= 3)
+        return false;
+    entry.count++;
+    return true;
+}
+// GET /api/reviews?sucursal=guerrero|madero  — público
+app.get("/api/reviews", async (req, res) => {
+    if (!usersPool) {
+        res.json({ ok: true, data: [] });
+        return;
+    }
+    const sucursal = req.query.sucursal ?? "";
+    if (!["guerrero", "madero"].includes(sucursal)) {
+        res.status(400).json({ ok: false, error: 'Parámetro sucursal inválido. Usa "guerrero" o "madero"' });
+        return;
+    }
+    try {
+        const [rows] = await usersPool.query(`SELECT
+         id,
+         author,
+         avatar,
+         rating,
+         comment,
+         dish,
+         sucursal,
+         verified,
+         DATE_FORMAT(created_at, '%Y-%m-%d') AS date
+       FROM reviews
+       WHERE sucursal = ?
+       ORDER BY created_at DESC
+       LIMIT 100`, [sucursal]);
+        const data = rows.map(r => ({
+            ...r,
+            id: String(r.id),
+            verified: Boolean(r.verified),
+        }));
+        res.json({ ok: true, data });
+    }
+    catch (err) {
+        console.error("[reviews GET]", err);
+        res.status(500).json({ ok: false, error: "Error al cargar reseñas" });
+    }
+});
+// POST /api/reviews  — requiere JWT
+app.post("/api/reviews", async (req, res) => {
+    if (!usersPool) {
+        res.status(503).json({ ok: false, error: "Reseñas no disponibles en este entorno" });
+        return;
+    }
+    const authData = getAuthUser(req, res);
+    if (!authData)
+        return;
+    if (!checkReviewRateLimit(authData.sub)) {
+        res.status(429).json({ ok: false, error: "Demasiadas reseñas. Intenta más tarde." });
+        return;
+    }
+    const rating = Number(req.body?.rating ?? 0);
+    const comment = (req.body?.comment ?? "").toString().trim();
+    const dish = (req.body?.dish ?? "").toString().trim();
+    const sucursal = (req.body?.sucursal ?? "").toString().trim();
+    if (rating < 1 || rating > 5) {
+        res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" });
+        return;
+    }
+    if (comment.length < 10 || comment.length > 1000) {
+        res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" });
+        return;
+    }
+    if (!["guerrero", "madero"].includes(sucursal)) {
+        res.status(422).json({ ok: false, error: "Sucursal inválida" });
+        return;
+    }
+    try {
+        const [rows] = await usersPool.query("SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1", [authData.sub]);
+        const usuario = rows[0];
+        if (!usuario) {
+            res.status(404).json({ ok: false, error: "Usuario no encontrado" });
+            return;
+        }
+        const author = usuario.nombre;
+        const avatar = author.charAt(0).toUpperCase();
+        const [result] = await usersPool.query(`INSERT INTO reviews (usuario_id, author, avatar, rating, comment, dish, sucursal, verified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`, [usuario.id, author, avatar, rating, comment, dish || null, sucursal]);
+        res.status(201).json({
+            ok: true,
+            data: {
+                id: String(result.insertId),
+                author,
+                avatar,
+                rating,
+                comment,
+                dish: dish || null,
+                sucursal,
+                verified: false,
+                date: new Date().toISOString().split("T")[0],
+            },
+        });
+    }
+    catch (err) {
+        console.error("[reviews POST]", err);
+        res.status(500).json({ ok: false, error: "Error al guardar reseña" });
     }
 });
 // ==========================================================
@@ -158,7 +296,6 @@ app.get("/api/dishes", async (_req, res) => {
         res.status(500).json({ message: "Error leyendo dishes" });
     }
 });
-// ── ÚNICO CAMBIO: quitado d.description que no existe en la tabla ─────────────
 app.get("/api/menu", async (_req, res) => {
     try {
         const [rows] = await pool.query(`
@@ -168,12 +305,16 @@ app.get("/api/menu", async (_req, res) => {
         d.price,
         d.category_id,
         d.image_path,
-        c.name AS category_name
+        c.name  AS category_name
       FROM dishes d
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
     `);
-        res.json(rows);
+        const data = rows.map(row => ({
+            ...row,
+            image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+        }));
+        res.json(data);
     }
     catch (error) {
         console.error(error);
@@ -183,7 +324,11 @@ app.get("/api/menu", async (_req, res) => {
 app.get("/api/products", async (_req, res) => {
     try {
         const [rows] = await pool.query("SELECT id, name, price, category_id, image_path FROM products");
-        res.json(rows);
+        const data = rows.map(row => ({
+            ...row,
+            image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+        }));
+        res.json(data);
     }
     catch (error) {
         console.error(error);

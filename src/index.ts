@@ -3,6 +3,8 @@ import cors from "cors";
 import "dotenv/config";
 import mysql from "mysql2/promise";
 import { pool } from "./db.js";
+import { googleReviewsRouter } from "./googleReviews.js";
+import facturasRouter from "./routes/facturas.route.js"; // ← NUEVO
 
 const app = express();
 
@@ -38,7 +40,11 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 // =====================================================
 
+app.use(cors(corsOptions));
 app.use(express.json());
+
+app.use("/api", googleReviewsRouter);
+app.use("/api/facturas", facturasRouter); // ← NUEVO
 
 // Base URL donde viven las imágenes (servidor Hostinger, no este container)
 const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
@@ -210,7 +216,6 @@ function checkReviewRateLimit(userId: number): boolean {
   return true;
 }
 
-// GET /api/reviews?sucursal=guerrero|madero  — público
 app.get("/api/reviews", async (req, res) => {
   if (!usersPool) { res.json({ ok: true, data: [] }); return; }
 
@@ -223,14 +228,7 @@ app.get("/api/reviews", async (req, res) => {
   try {
     const [rows] = await usersPool.query(
       `SELECT
-         id,
-         author,
-         avatar,
-         rating,
-         comment,
-         dish,
-         sucursal,
-         verified,
+         id, author, avatar, rating, comment, dish, sucursal, verified,
          DATE_FORMAT(created_at, '%Y-%m-%d') AS date
        FROM reviews
        WHERE sucursal = ?
@@ -243,20 +241,13 @@ app.get("/api/reviews", async (req, res) => {
       verified: number; date: string;
     }>, unknown];
 
-    const data = rows.map(r => ({
-      ...r,
-      id:       String(r.id),
-      verified: Boolean(r.verified),
-    }));
-
-    res.json({ ok: true, data });
+    res.json({ ok: true, data: rows.map(r => ({ ...r, id: String(r.id), verified: Boolean(r.verified) })) });
   } catch (err) {
     console.error("[reviews GET]", err);
     res.status(500).json({ ok: false, error: "Error al cargar reseñas" });
   }
 });
 
-// POST /api/reviews  — requiere JWT
 app.post("/api/reviews", async (req, res) => {
   if (!usersPool) {
     res.status(503).json({ ok: false, error: "Reseñas no disponibles en este entorno" });
@@ -277,16 +268,13 @@ app.post("/api/reviews", async (req, res) => {
   const sucursal = (req.body?.sucursal ?? "").toString().trim();
 
   if (rating < 1 || rating > 5) {
-    res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" });
-    return;
+    res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" }); return;
   }
   if (comment.length < 10 || comment.length > 1000) {
-    res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" });
-    return;
+    res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" }); return;
   }
   if (!["guerrero", "madero"].includes(sucursal)) {
-    res.status(422).json({ ok: false, error: "Sucursal inválida" });
-    return;
+    res.status(422).json({ ok: false, error: "Sucursal inválida" }); return;
   }
 
   try {
@@ -310,15 +298,9 @@ app.post("/api/reviews", async (req, res) => {
     res.status(201).json({
       ok: true,
       data: {
-        id:       String(result.insertId),
-        author,
-        avatar,
-        rating,
-        comment,
-        dish:     dish || null,
-        sucursal,
-        verified: false,
-        date:     new Date().toISOString().split("T")[0],
+        id: String(result.insertId), author, avatar, rating, comment,
+        dish: dish || null, sucursal, verified: false,
+        date: new Date().toISOString().split("T")[0],
       },
     });
   } catch (err) {
@@ -341,13 +323,7 @@ app.get("/api/dishes", async (_req, res) => {
 app.get("/api/menu", async (_req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT
-        d.id,
-        d.name,
-        d.price,
-        d.category_id,
-        d.image_path,
-        c.name  AS category_name
+      SELECT d.id, d.name, d.price, d.category_id, d.image_path, c.name AS category_name
       FROM dishes d
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
