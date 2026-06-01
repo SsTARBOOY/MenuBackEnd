@@ -133,10 +133,12 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   }
 
   const cfdi = await createRes.json() as {
+    
     Id: string;
     Folio: string;
     Complement?: { TaxStamp?: { Uuid?: string } };
   };
+console.log("[Facturama] CFDI response:", JSON.stringify(cfdi, null, 2));
 
   const cfdiId = cfdi.Id;
   const uuid   = cfdi.Complement?.TaxStamp?.Uuid ?? "";
