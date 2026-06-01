@@ -94,6 +94,7 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
 
 /* ══════════════════════════════════════════════════════════════
    POST /api/facturas/solicitar
+   Guarda la solicitud Y timbra automáticamente con Facturama
 ══════════════════════════════════════════════════════════════ */
 export const solicitarFactura = async (req: Request, res: Response): Promise<void> => {
   const { orderId, sucursal: sucursalRaw, rfc, razonSocial,
@@ -131,6 +132,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       res.status(409).json({ error: "Ya existe una solicitud activa para esta orden." }); return;
     }
 
+    // ── 1. Guardar solicitud ──────────────────────────────────
     const [result] = await pool.query(
       `INSERT INTO factura_requests
          (order_id, rfc, razon_social, regimen_fiscal, codigo_postal, uso_cfdi, email)
@@ -139,10 +141,66 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
        regimenFiscal, codigoPostal, usoCfdi, email.toLowerCase().trim()]
     ) as [import("mysql2").ResultSetHeader, unknown];
 
-    res.status(201).json({
-      success: true, solicitudId: result.insertId, sucursal,
-      message: `Solicitud registrada. Recibirás tu CFDI en ${email} en 24–48 horas.`,
-    });
+    const solicitudId = result.insertId;
+
+    // ── 2. Obtener orden e items para timbrar ─────────────────
+    const [orderRows] = await pool.query(
+      `SELECT id, order_date, created_at, payment_method, total, tax, total_with_tax
+       FROM orders WHERE id = ? LIMIT 1`, [parseInt(orderId, 10)]
+    ) as [Array<Record<string, any>>, unknown];
+
+    const [itemRows] = await pool.query(
+      `SELECT item_name, quantity, price AS subtotal,
+              ROUND(price / quantity, 6) AS unit_price
+       FROM order_items WHERE order_id = ? ORDER BY id`,
+      [parseInt(orderId, 10)]
+    ) as [Array<Record<string, any>>, unknown];
+
+    // ── 3. Timbrar con Facturama ──────────────────────────────
+    try {
+      const { crearCfdi } = await import("../services/facturama.service.js");
+      const order = (orderRows as any[])[0];
+      const fecha = new Date(order.order_date ?? order.created_at).toISOString().slice(0, 19);
+
+      const cfdi = await crearCfdi({
+        folio:         String(orderId).padStart(6, "0"),
+        fecha,
+        paymentMethod: order.payment_method,
+        receiver: {
+          rfc:           rfc.toUpperCase(),
+          razonSocial:   razonSocial.trim(),
+          regimenFiscal, codigoPostal, usoCfdi,
+        },
+        items: (itemRows as any[]).map(i => ({
+          dishName:  i.item_name,
+          quantity:  Number(i.quantity),
+          unitPrice: Number(i.unit_price),
+          subtotal:  Number(i.subtotal),
+        })),
+        email: email.toLowerCase().trim(),
+      });
+
+      // Actualizar a procesada con UUID
+      await pool.query(
+        `UPDATE factura_requests SET status = 'procesada', notas = ? WHERE id = ?`,
+        [`CFDI: ${cfdi.uuid} | ID: ${cfdi.cfdiId}`, solicitudId]
+      );
+
+      res.status(201).json({
+        success: true, solicitudId, uuid: cfdi.uuid,
+        message: `Factura timbrada y enviada a ${email}.`,
+      });
+
+    } catch (factuErr: any) {
+      // Si Facturama falla, la solicitud queda en 'pendiente' para revisión manual
+      console.error("[facturas] timbrado automático falló:", factuErr?.message);
+      res.status(201).json({
+        success: true, solicitudId,
+        warning: "Solicitud registrada. El timbrado se procesará en 24–48 horas.",
+        message: `Tu solicitud fue registrada. Recibirás tu CFDI en ${email} pronto.`,
+      });
+    }
+
   } catch (err) {
     console.error("[facturas] solicitarFactura error:", err);
     res.status(500).json({ error: "Error interno al guardar la solicitud." });
