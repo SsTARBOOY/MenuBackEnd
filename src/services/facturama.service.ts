@@ -89,15 +89,25 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     };
   });
 
-  const body = {
+  const isPublico = data.receiver.rfc.toUpperCase() === "XAXX010101000";
+  const now = new Date();
+
+  const body: Record<string, unknown> = {
     NameId:          "1",
     Folio:           data.folio,
     Date:            data.fecha,
     PaymentForm:     mapPaymentForm(data.paymentMethod),
-    PaymentMethod:   "PUE",                     // Pago en una sola exhibición
+    PaymentMethod:   "PUE",
     ExpeditionPlace: process.env.FACTURAMA_CP ?? "76000",
-    CfdiType:        "I",                       // Ingreso
+    CfdiType:        "I",
     Currency:        "MXN",
+    ...(isPublico ? {
+      GlobalInformation: {
+        Periodicity: "04",
+        Months:      String(now.getMonth() + 1).padStart(2, "0"),
+        Year:        String(now.getFullYear()),
+      }
+    } : {}),
     Receiver: {
       Rfc:           data.receiver.rfc.toUpperCase(),
       Name:          data.receiver.razonSocial.trim(),
