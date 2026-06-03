@@ -1,12 +1,17 @@
 import express from "express";
 import cors from "cors";
+import path from "path";
+import { fileURLToPath } from "url";
 import "dotenv/config";
 import mysql from "mysql2/promise";
 import { pool } from "./db.js";
 import { googleReviewsRouter } from "./googleReviews.js";
-import facturasRouter from "./routes/facturas.route.js"; // ← NUEVO
+import facturasRouter from "./routes/facturas.route.js";
 
 const app = express();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
 // ==================== CORS CONFIG ====================
 const ALLOWED_ORIGINS = [
@@ -40,13 +45,25 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 // =====================================================
 
-app.use(cors(corsOptions));
 app.use(express.json());
 
-app.use("/api", googleReviewsRouter);
-app.use("/api/facturas", facturasRouter); // ← NUEVO
+// ── Servir imágenes estáticas ──────────────────────────────────────────────────
+// Las imágenes se guardan en uploads/dishes/ en la raíz del proyecto
+// El compilado queda en dist/ → un nivel arriba está uploads/
+const UPLOADS_DIR = path.join(__dirname, "..", "public", "uploads");
+console.log(`📁 Uploads dir: ${UPLOADS_DIR}`);
 
-// Base URL donde viven las imágenes (servidor Hostinger, no este container)
+app.use("/uploads", (_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
+}, express.static(UPLOADS_DIR));
+// ──────────────────────────────────────────────────────────────────────────────
+
+app.use("/api", googleReviewsRouter);
+app.use("/api/facturas", facturasRouter);
+
+// Base URL donde viven las imágenes
 const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
 
 // ==================== POOL DB USUARIOS ====================
@@ -97,10 +114,7 @@ function verifyToken(token: string): { sub: number; rol: string } | null {
   }
 }
 
-function getAuthUser(
-  req: express.Request,
-  res: express.Response
-): { sub: number; rol: string } | null {
+function getAuthUser(req: express.Request, res: express.Response): { sub: number; rol: string } | null {
   const auth = req.headers.authorization ?? "";
   if (!auth.startsWith("Bearer ")) {
     res.status(401).json({ ok: false, error: "No autorizado" });
@@ -116,7 +130,7 @@ function getAuthUser(
 // =============================================================
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, uploadsDir: UPLOADS_DIR });
 });
 
 // ==================== GALLERY COMMENTS ====================
@@ -199,7 +213,6 @@ app.post("/api/gallery-comments", async (req, res) => {
     res.status(500).json({ ok: false, error: "Error al guardar comentario" });
   }
 });
-// ==========================================================
 
 // ==================== REVIEWS ============================
 
@@ -227,19 +240,12 @@ app.get("/api/reviews", async (req, res) => {
 
   try {
     const [rows] = await usersPool.query(
-      `SELECT
-         id, author, avatar, rating, comment, dish, sucursal, verified,
+      `SELECT id, author, avatar, rating, comment, dish, sucursal, verified,
          DATE_FORMAT(created_at, '%Y-%m-%d') AS date
-       FROM reviews
-       WHERE sucursal = ?
-       ORDER BY created_at DESC
-       LIMIT 100`,
+       FROM reviews WHERE sucursal = ?
+       ORDER BY created_at DESC LIMIT 100`,
       [sucursal]
-    ) as [Array<{
-      id: number; author: string; avatar: string; rating: number;
-      comment: string; dish: string | null; sucursal: string;
-      verified: number; date: string;
-    }>, unknown];
+    ) as [Array<{ id: number; author: string; avatar: string; rating: number; comment: string; dish: string | null; sucursal: string; verified: number; date: string }>, unknown];
 
     res.json({ ok: true, data: rows.map(r => ({ ...r, id: String(r.id), verified: Boolean(r.verified) })) });
   } catch (err) {
@@ -267,20 +273,13 @@ app.post("/api/reviews", async (req, res) => {
   const dish     = (req.body?.dish     ?? "").toString().trim();
   const sucursal = (req.body?.sucursal ?? "").toString().trim();
 
-  if (rating < 1 || rating > 5) {
-    res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" }); return;
-  }
-  if (comment.length < 10 || comment.length > 1000) {
-    res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" }); return;
-  }
-  if (!["guerrero", "madero"].includes(sucursal)) {
-    res.status(422).json({ ok: false, error: "Sucursal inválida" }); return;
-  }
+  if (rating < 1 || rating > 5) { res.status(422).json({ ok: false, error: "Calificación inválida (1-5)" }); return; }
+  if (comment.length < 10 || comment.length > 1000) { res.status(422).json({ ok: false, error: "Comentario inválido (10-1000 caracteres)" }); return; }
+  if (!["guerrero", "madero"].includes(sucursal)) { res.status(422).json({ ok: false, error: "Sucursal inválida" }); return; }
 
   try {
     const [rows] = await usersPool.query(
-      "SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1",
-      [authData.sub]
+      "SELECT id, nombre FROM usuarios WHERE id = ? LIMIT 1", [authData.sub]
     ) as [Array<{ id: number; nombre: string }>, unknown];
 
     const usuario = rows[0];
@@ -297,11 +296,7 @@ app.post("/api/reviews", async (req, res) => {
 
     res.status(201).json({
       ok: true,
-      data: {
-        id: String(result.insertId), author, avatar, rating, comment,
-        dish: dish || null, sucursal, verified: false,
-        date: new Date().toISOString().split("T")[0],
-      },
+      data: { id: String(result.insertId), author, avatar, rating, comment, dish: dish || null, sucursal, verified: false, date: new Date().toISOString().split("T")[0] },
     });
   } catch (err) {
     console.error("[reviews POST]", err);
@@ -328,9 +323,12 @@ app.get("/api/menu", async (_req, res) => {
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
     `) as [Array<Record<string, unknown>>, unknown];
+
     const data = rows.map(row => ({
       ...row,
-      image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+      image_path: STATIC_BASE_URL && row.image_path
+        ? `${STATIC_BASE_URL}${row.image_path}`
+        : row.image_path,
     }));
     res.json(data);
   } catch (error) {
@@ -346,7 +344,9 @@ app.get("/api/products", async (_req, res) => {
     ) as [Array<Record<string, unknown>>, unknown];
     const data = rows.map(row => ({
       ...row,
-      image_path: STATIC_BASE_URL ? `${STATIC_BASE_URL}${row.image_path}` : row.image_path,
+      image_path: STATIC_BASE_URL && row.image_path
+        ? `${STATIC_BASE_URL}${row.image_path}`
+        : row.image_path,
     }));
     res.json(data);
   } catch (error) {
@@ -356,8 +356,7 @@ app.get("/api/products", async (_req, res) => {
 });
 
 const PORT = Number(process.env.PORT ?? 4000);
-
 app.listen(PORT, () => {
   console.log(`✅ API corriendo en http://localhost:${PORT}`);
-  console.log(`🖼️  Imágenes en   http://localhost:${PORT}/uploads/`);
+  console.log(`📁 Uploads desde: ${UPLOADS_DIR}`);
 });
