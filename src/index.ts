@@ -310,7 +310,7 @@ app.get("/api/dishes", async (_req, res) => {
     const [rows] = await pool.query("SELECT id, name FROM dishes ORDER BY id DESC");
     res.json(rows);
   } catch (error) {
-    console.error(error);
+    console.error("[dishes]", error);
     res.status(500).json({ message: "Error leyendo dishes" });
   }
 });
@@ -332,7 +332,7 @@ app.get("/api/menu", async (_req, res) => {
     }));
     res.json(data);
   } catch (error) {
-    console.error(error);
+    console.error("[menu]", error);
     res.status(500).json({ message: "Error leyendo menú" });
   }
 });
@@ -350,10 +350,18 @@ app.get("/api/products", async (_req, res) => {
     }));
     res.json(data);
   } catch (error) {
-    console.error(error);
+    console.error("[products]", error);
     res.status(500).json({ message: "Error leyendo productos" });
   }
 });
+
+// ── Global error handler ────────────────────────────────────────────────────
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error("[error]", err?.message ?? String(err));
+  if (err?.code) console.error("[error] código MySQL:", err.code);
+  res.status(err?.status ?? 500).json({ ok: false, error: "Error interno del servidor" });
+});
+// ────────────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env.PORT ?? 4000);
 app.listen(PORT, () => {

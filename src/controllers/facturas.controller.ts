@@ -161,8 +161,8 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       const { crearCfdi } = await import("../services/facturama.service.js");
       const order = (orderRows as any[])[0];
 
-      // ⚠️ Siempre usar fecha actual — el SAT no permite timbrar con más de 72h de antigüedad
-      const fechaTimbrado = new Date().toISOString().slice(0, 19);
+      // ⚠️ Siempre hora México (UTC-6) — el SAT rechaza CFDIs con fecha > 72h
+      const fechaTimbrado = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19);
 
       const cfdi = await crearCfdi({
         folio: `${String(orderId).padStart(6, "0")}-${Date.now()}`,
@@ -194,7 +194,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       });
 
     } catch (factuErr: any) {
-      console.error("[facturas] timbrado automático falló:", factuErr?.message);
+      console.error("[facturas] timbrado automático falló:", factuErr);
       res.status(201).json({
         success: true, solicitudId,
         warning: "Solicitud registrada. El timbrado se procesará en 24–48 horas.",
@@ -247,12 +247,12 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
 
     const { crearCfdi } = await import("../services/facturama.service.js");
 
-    // ⚠️ Siempre usar fecha actual — el SAT no permite timbrar con más de 72h de antigüedad
-    const fechaTimbrado = new Date().toISOString().slice(0, 19);
+    // ⚠️ Siempre hora México (UTC-6) — el SAT rechaza CFDIs con fecha > 72h
+    const fechaTimbrado = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19);
     const order = (orderRows as any[])[0];
 
     const result = await crearCfdi({
-      folio:         String(sol.order_id).padStart(6, "0"),
+      folio:         `${String(sol.order_id).padStart(6, "0")}-${Date.now()}`,
       fecha:         fechaTimbrado,
       paymentMethod: order.payment_method,
       receiver: {
