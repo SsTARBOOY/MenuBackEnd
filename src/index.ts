@@ -318,7 +318,10 @@ app.get("/api/dishes", async (_req, res) => {
 app.get("/api/menu", async (_req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT d.id, d.name, d.price, d.category_id, d.image_path, c.name AS category_name
+      SELECT d.id, d.name, d.description, d.price, d.category_id, d.image_path,
+             c.name AS category_name,
+             c.bg_color AS category_bg_color,
+             c.icon AS category_icon
       FROM dishes d
       LEFT JOIN categories c ON c.id = d.category_id
       ORDER BY c.id, d.name
