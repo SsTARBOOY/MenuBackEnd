@@ -197,7 +197,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       console.error("[facturas] timbrado automático falló:", factuErr);
       res.status(201).json({
         success: true, solicitudId,
-        warning: "Solicitud registrada. El timbrado se procesará en 24–48 horas.",
+        warning: "Solicitud registrada. Nos pondremos en contacto contigo a la brevedad para completar la emisión de tu comprobante fiscal.",
         message: `Tu solicitud fue registrada. Recibirás tu CFDI en ${email} pronto.`,
       });
     }
