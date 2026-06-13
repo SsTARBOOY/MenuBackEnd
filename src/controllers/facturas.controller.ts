@@ -1,6 +1,12 @@
 // server/src/controllers/facturas.controller.ts
 import { Request, Response } from "express";
 import { getPool, Sucursal } from "../db-sucursales.js";
+import {
+  crearCfdi,
+  validarReceptorSat,
+  FacturamaRejectionError,
+  FacturamaUnavailableError,
+} from "../services/facturama.service.js";
 
 const parseSucursal = (val: unknown): Sucursal | null => {
   if (val === "guerrero" || val === "madero") return val;
@@ -156,11 +162,32 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       [parseInt(orderId, 10)]
     ) as [Array<Record<string, any>>, unknown];
 
-    // ── 3. Timbrar con Facturama ──────────────────────────────
-    try {
-      const { crearCfdi } = await import("../services/facturama.service.js");
-      const order = (orderRows as any[])[0];
+    const order = (orderRows as any[])[0];
 
+    // ── 3. Pre-validación del receptor contra el SAT (Grupo F) ────
+    // Fail-open: si no se puede verificar (endpoint desactivado/caído) se procede a timbrar.
+    const validacion = await validarReceptorSat({
+      rfc: rfc.toUpperCase(),
+      name: razonSocial,
+      regimenFiscal,
+      codigoPostal,
+    });
+    if (validacion.verificado && !validacion.valido) {
+      // NO se timbra y NO se deja la orden trabada: se cancela para permitir reintento.
+      await pool.query(
+        `UPDATE factura_requests SET status = 'cancelada', notas = ? WHERE id = ?`,
+        ["pre-validacion SAT no superada", solicitudId]
+      ).catch(() => {});
+      res.status(422).json({
+        ok: false, error: "validacion_receptor", solicitudId, reintentable: true,
+        message: "Tus datos fiscales no coinciden con el padrón del SAT. Verifica que tu RFC, nombre, régimen fiscal y código postal sean idénticos a tu Constancia de Situación Fiscal.",
+        detail: validacion.motivo ?? null,
+      });
+      return;
+    }
+
+    // ── 4. Timbrar con Facturama ──────────────────────────────
+    try {
       // ⚠️ Siempre hora México (UTC-6) — el SAT rechaza CFDIs con fecha > 72h
       const fechaTimbrado = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19);
 
@@ -182,7 +209,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
         email: email.toLowerCase().trim(),
       });
 
-      // Actualizar a procesada con UUID
+      // Camino de ÉXITO — NO se modifica: procesada + UUID real
       await pool.query(
         `UPDATE factura_requests SET status = 'procesada', notas = ? WHERE id = ?`,
         [`CFDI: ${cfdi.uuid} | ID: ${cfdi.cfdiId}`, solicitudId]
@@ -194,11 +221,30 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       });
 
     } catch (factuErr: any) {
-      console.error("[facturas] timbrado automático falló:", factuErr);
-      res.status(201).json({
-        success: true, solicitudId,
-        warning: "Solicitud registrada. Nos pondremos en contacto contigo a la brevedad para completar la emisión de tu comprobante fiscal.",
-        message: `Tu solicitud fue registrada. Recibirás tu CFDI en ${email} pronto.`,
+      // Grupo B: NO dejar la orden trabada. Se revierte a 'cancelada' para permitir reintento.
+      await pool.query(
+        `UPDATE factura_requests SET status = 'cancelada', notas = ? WHERE id = ?`,
+        [`timbrado fallido: ${factuErr?.name ?? "error"}`, solicitudId]
+      ).catch(() => { /* no enmascarar el error original */ });
+
+      // Grupo H: log SIN PII — solo solicitudId + tipo de error + detalle recortado.
+      const detalle = (factuErr instanceof FacturamaRejectionError || factuErr instanceof FacturamaUnavailableError)
+        ? factuErr.detail : (factuErr?.message ?? "error");
+      console.error(`[facturas] timbrado fallido solicitud=${solicitudId} tipo=${factuErr?.name ?? "Error"} detalle=${String(detalle).slice(0, 200)}`);
+
+      // Grupo C: devolver el error REAL y accionable con código correcto (nunca 201 success).
+      if (factuErr instanceof FacturamaUnavailableError) {
+        res.status(503).json({
+          ok: false, error: "facturama_no_disponible", solicitudId, reintentable: true,
+          message: "El servicio de facturación no está disponible en este momento. Tu orden NO quedó bloqueada; vuelve a intentarlo en unos minutos.",
+          detail: null,
+        });
+        return;
+      }
+      res.status(422).json({
+        ok: false, error: "facturama_rechazo", solicitudId, reintentable: true,
+        message: "No pudimos emitir tu factura. Verifica que tu RFC, nombre, régimen fiscal y código postal coincidan EXACTAMENTE con tu Constancia de Situación Fiscal.",
+        detail: factuErr instanceof FacturamaRejectionError ? factuErr.detail : null,
       });
     }
 
@@ -245,8 +291,6 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
       [sol.order_id]
     ) as [Array<Record<string, any>>, unknown];
 
-    const { crearCfdi } = await import("../services/facturama.service.js");
-
     // ⚠️ Siempre hora México (UTC-6) — el SAT rechaza CFDIs con fecha > 72h
     const fechaTimbrado = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19);
     const order = (orderRows as any[])[0];
@@ -284,7 +328,28 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
     });
 
   } catch (err: any) {
-    console.error("[facturas] timbrarFactura error:", err);
-    res.status(500).json({ error: err?.message ?? "Error al timbrar." });
+    // Grupo H: log SIN PII. La solicitud queda en 'pendiente' para que admin reintente.
+    const detalle = (err instanceof FacturamaRejectionError || err instanceof FacturamaUnavailableError)
+      ? err.detail : (err?.message ?? "error");
+    console.error(`[facturas] timbrarFactura fallido solicitud=${solicitudId} tipo=${err?.name ?? "Error"} detalle=${String(detalle).slice(0, 200)}`);
+
+    // Grupo C: error real y accionable con código correcto.
+    if (err instanceof FacturamaUnavailableError) {
+      res.status(503).json({
+        ok: false, error: "facturama_no_disponible", reintentable: true,
+        message: "El servicio de facturación no está disponible. Intenta de nuevo en unos minutos.",
+        detail: null,
+      });
+      return;
+    }
+    if (err instanceof FacturamaRejectionError) {
+      res.status(422).json({
+        ok: false, error: "facturama_rechazo", reintentable: true,
+        message: "El SAT rechazó el comprobante. Revisa que RFC, nombre, régimen fiscal y código postal coincidan con la Constancia.",
+        detail: err.detail,
+      });
+      return;
+    }
+    res.status(500).json({ ok: false, error: "error_interno", message: "Error al timbrar." });
   }
 };

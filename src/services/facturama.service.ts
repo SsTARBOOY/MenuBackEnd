@@ -8,6 +8,7 @@
 // ─────────────────────────────────────────────────────────────────
 
 const API_URL = (process.env.FACTURAMA_URL ?? "https://api.facturama.mx").replace(/\/$/, "");
+const FACTURAMA_TIMEOUT_MS = Number(process.env.FACTURAMA_TIMEOUT_MS ?? "20000");
 
 const getAuth = () => {
   const user = process.env.FACTURAMA_USER ?? "";
@@ -23,6 +24,51 @@ const mapPaymentForm = (method: string | null): string => {
   if (m.includes("transferencia") || m.includes("trans")) return "03";
   return "01";
 };
+
+// ── Normalización del Nombre del receptor (decisión fiscal de Oscar) ──
+// CFDI 4.0: el Nombre debe coincidir EXACTO con el padrón del SAT, que CONSERVA
+// acentos y Ñ. Por eso SOLO se normaliza casing y espacios — NUNCA se quitan
+// acentos (quitarlos crea mismatches nuevos; confirmado por legal-fiscal).
+export const normalizeReceiverName = (raw: string): string =>
+  (raw ?? "").replace(/\s+/g, " ").trim().toUpperCase();
+
+// ── Errores tipados para distinguir "rechazo del SAT/PAC" de "servicio caído" ──
+// Grupo C/H: el controlador los traduce a 422 (rechazo accionable) vs 503 (reintenta luego).
+export class FacturamaRejectionError extends Error {
+  constructor(public detail: string, public status: number) {
+    super("FACTURAMA_RECHAZO");
+    this.name = "FacturamaRejectionError";
+  }
+}
+export class FacturamaUnavailableError extends Error {
+  constructor(public detail: string) {
+    super("FACTURAMA_NO_DISPONIBLE");
+    this.name = "FacturamaUnavailableError";
+  }
+}
+
+// Extrae un mensaje legible del cuerpo de error de Facturama, SIN volcar PII.
+export function parseFacturamaError(raw: string): string {
+  try {
+    const j = JSON.parse(raw) as { Message?: string; ModelState?: Record<string, string[]> };
+    if (j.ModelState) {
+      const msgs = Object.values(j.ModelState).flat().filter(Boolean);
+      if (msgs.length) return String(msgs[0]).slice(0, 300);
+    }
+    if (j.Message) return String(j.Message).slice(0, 300);
+  } catch { /* no era JSON */ }
+  return (raw ?? "").slice(0, 300);
+}
+
+// fetch con timeout que normaliza fallos de red/timeout a FacturamaUnavailableError.
+async function facturamaFetch(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(FACTURAMA_TIMEOUT_MS) });
+  } catch (e: any) {
+    const reason = e?.name === "TimeoutError" ? "timeout" : (e?.name ?? "network_error");
+    throw new FacturamaUnavailableError(reason);
+  }
+}
 
 // ── Interfaces ──────────────────────────────────────────────────
 export interface CfdiItem {
@@ -55,6 +101,45 @@ export interface CfdiResult {
   folio: string;
   pdfBase64: string;
   xmlBase64: string;
+}
+
+// ── Grupo F: pre-validación del receptor contra el SAT (scaffold fail-open) ──
+// ⚠️ La API de Facturama no expone (en la skill /cfdi-facturama) un endpoint
+// confirmado de validación contra la lista de RFC inscritos (LCO). Hasta
+// confirmarlo, esta función queda DESACTIVADA por env y devuelve verificado=false
+// (fail-open): el llamador debe proceder a timbrar con normalidad.
+// Para activarla: FACTURAMA_VALIDATE_ENABLED=true + FACTURAMA_VALIDATE_URL=<endpoint real>.
+export interface ReceptorValidationInput {
+  rfc: string;
+  name: string;
+  regimenFiscal: string;
+  codigoPostal: string;
+}
+export interface ReceptorValidationResult {
+  valido: boolean;
+  verificado: boolean;   // false => no se pudo verificar; NO bloquear el timbrado
+  motivo?: string;
+}
+
+export async function validarReceptorSat(
+  input: ReceptorValidationInput
+): Promise<ReceptorValidationResult> {
+  if (process.env.FACTURAMA_VALIDATE_ENABLED !== "true") {
+    return { valido: true, verificado: false };
+  }
+  const base = process.env.FACTURAMA_VALIDATE_URL;
+  if (!base) return { valido: true, verificado: false };
+
+  try {
+    const url = `${base}?rfc=${encodeURIComponent(input.rfc)}`;
+    const res = await facturamaFetch(url, { headers: { Authorization: getAuth() } });
+    if (!res.ok) return { valido: true, verificado: false }; // fail-open ante error del endpoint
+    const data = await res.json() as { valid?: boolean; isValid?: boolean; message?: string };
+    const valido = Boolean(data?.valid ?? data?.isValid);
+    return { valido, verificado: true, motivo: valido ? undefined : (data?.message ?? "RFC/Nombre no validado por el SAT") };
+  } catch {
+    return { valido: true, verificado: false }; // fail-open ante caída/timeout
+  }
 }
 
 // ── Crear CFDI 4.0 (Ingreso) ────────────────────────────────────
@@ -110,7 +195,8 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     } : {}),
     Receiver: {
       Rfc: data.receiver.rfc.toUpperCase(),
-      Name: data.receiver.razonSocial.trim(),
+      // Grupo A: solo MAYÚSCULAS + espacios colapsados, CONSERVANDO acentos y Ñ.
+      Name: normalizeReceiverName(data.receiver.razonSocial),
       CfdiUse: data.receiver.usoCfdi,
       FiscalRegime: data.receiver.regimenFiscal,
       TaxZipCode: data.receiver.codigoPostal,
@@ -120,7 +206,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
 
   // ── 1. Crear CFDI ─────────────────────────────────────────────
   // Endpoint correcto según docs: POST /3/cfdis
-  const createRes = await fetch(`${API_URL}/3/cfdis`, {
+  const createRes = await facturamaFetch(`${API_URL}/3/cfdis`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -130,8 +216,12 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   });
 
   if (!createRes.ok) {
-    const err = await createRes.text();
-    throw new Error(`Facturama error al crear CFDI: ${createRes.status} – ${err}`);
+    const errText = await createRes.text();
+    // Grupo H: 5xx / 408 => servicio caído (reintenta luego); 4xx => rechazo del SAT (accionable).
+    if (createRes.status >= 500 || createRes.status === 408) {
+      throw new FacturamaUnavailableError(`HTTP ${createRes.status}`);
+    }
+    throw new FacturamaRejectionError(parseFacturamaError(errText), createRes.status);
   }
 
   const cfdi = await createRes.json() as {
@@ -140,49 +230,39 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     Complement?: { TaxStamp?: { Uuid?: string } };
   };
 
-  console.log("[Facturama] CFDI creado:", JSON.stringify({
-    Id: cfdi.Id,
-    Folio: cfdi.Folio,
-    Uuid: cfdi.Complement?.TaxStamp?.Uuid,
-  }));
-
   const cfdiId = cfdi.Id;
-  const uuid = cfdi.Complement?.TaxStamp?.Uuid ?? "";
-
-  // ── 2. Descargar PDF ──────────────────────────────────────────
-  // Endpoint: GET /Cfdi/pdf/issued/{id}
-  const pdfRes = await fetch(
-    `${API_URL}/Cfdi/pdf/issued/${cfdiId}`,
-    { headers: { "Authorization": getAuth() } }
-  );
-  const pdfData = pdfRes.ok
-    ? ((await pdfRes.json()) as { Content: string }).Content
-    : "";
-
-  // ── 3. Descargar XML ──────────────────────────────────────────
-  // Endpoint: GET /Cfdi/xml/issued/{id}
-  const xmlRes = await fetch(
-    `${API_URL}/Cfdi/xml/issued/${cfdiId}`,
-    { headers: { "Authorization": getAuth() } }
-  );
-  const xmlData = xmlRes.ok
-    ? ((await xmlRes.json()) as { Content: string }).Content
-    : "";
-
-  // ── 4. Enviar por email ───────────────────────────────────────
-  // Endpoint: POST /cfdi?CfdiType=issued&CfdiId={id}&Email={email}
-  // Los parámetros van en la URL (query params), NO en el body
-  const emailUrl = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(data.email)}`;
-  const emailRes = await fetch(emailUrl, {
-    method: "POST",
-    headers: { "Authorization": getAuth() },
-  });
-
-  if (!emailRes.ok) {
-    const emailErr = await emailRes.text();
-    console.warn("[Facturama] Email warning:", emailErr);
-    // No lanzar error — el CFDI ya fue timbrado, el email es secundario
+  // Grupo D: sin UUID real NO hay factura. Se trata como rechazo, NUNCA como procesada.
+  const uuid = cfdi.Complement?.TaxStamp?.Uuid;
+  if (!uuid) {
+    throw new FacturamaRejectionError(
+      "El comprobante no devolvió timbre fiscal (UUID). No se marcará como facturado.",
+      502
+    );
   }
+
+  // Log sin PII: solo identificadores del CFDI, nunca el payload del receptor.
+  console.log("[Facturama] CFDI timbrado:", JSON.stringify({ Id: cfdiId, Folio: cfdi.Folio }));
+
+  // ── 2-4. Descargas y email: NO deben tumbar el éxito ya timbrado ──
+  // (CFDI ya tiene UUID; PDF/XML/email son secundarios → fail-soft, nunca throw.)
+  let pdfData = "";
+  let xmlData = "";
+  try {
+    const pdfRes = await facturamaFetch(`${API_URL}/Cfdi/pdf/issued/${cfdiId}`, { headers: { "Authorization": getAuth() } });
+    if (pdfRes.ok) pdfData = ((await pdfRes.json()) as { Content: string }).Content;
+  } catch (e: any) { console.warn("[Facturama] PDF no disponible:", e?.name ?? "error"); }
+
+  try {
+    const xmlRes = await facturamaFetch(`${API_URL}/Cfdi/xml/issued/${cfdiId}`, { headers: { "Authorization": getAuth() } });
+    if (xmlRes.ok) xmlData = ((await xmlRes.json()) as { Content: string }).Content;
+  } catch (e: any) { console.warn("[Facturama] XML no disponible:", e?.name ?? "error"); }
+
+  try {
+    // Endpoint: POST /cfdi?CfdiType=issued&CfdiId={id}&Email={email}  (query params, NO body)
+    const emailUrl = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(data.email)}`;
+    const emailRes = await facturamaFetch(emailUrl, { method: "POST", headers: { "Authorization": getAuth() } });
+    if (!emailRes.ok) console.warn("[Facturama] Email warning:", emailRes.status);
+  } catch (e: any) { console.warn("[Facturama] Email no enviado:", e?.name ?? "error"); }
 
   return {
     cfdiId,

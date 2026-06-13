@@ -10,6 +10,10 @@ import facturasRouter from "./routes/facturas.route.js";
 
 const app = express();
 
+// Detrás de Coolify + Cloudflare: confiar en el primer proxy para que req.ip sea la IP
+// real del cliente (y el rate-limit por IP no sea evadible con X-Forwarded-For falso).
+app.set("trust proxy", 1);
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
