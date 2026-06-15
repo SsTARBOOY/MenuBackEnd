@@ -16,13 +16,34 @@ const getAuth = () => {
   return "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 };
 
-const mapPaymentForm = (method: string | null): string => {
-  const m = (method ?? "").toLowerCase();
+// ── Forma de pago (catálogo SAT c_FormaPago) ─────────────────────
+// Con PaymentMethod = "PUE" la FormaPago debe reflejar el pago real; por eso
+// NUNCA se defaultea a Efectivo. Claves soportadas por La Peña (validado por
+// legal-fiscal): 01 Efectivo · 03 Transferencia · 04 T. crédito · 28 T. débito.
+export const FORMAS_PAGO_VALIDAS = new Set(["01", "03", "04", "28"]);
+
+// Type guard: estrecha a `string` cuando la clave pertenece al catálogo soportado.
+export const isFormaPagoValida = (clave: string | null | undefined): clave is string =>
+  typeof clave === "string" && FORMAS_PAGO_VALIDAS.has(clave);
+
+// Mapea el texto libre de la orden a una clave SAT c_FormaPago.
+// Devuelve null cuando NO se puede determinar con confianza (p. ej. "Pending",
+// null, vacío o ambiguo) — el llamador decide (exigir captura explícita).
+// Exportada para que el controlador la reutilice al resolver la forma de pago.
+export const mapPaymentForm = (method: string | null): string | null => {
+  const m = (method ?? "").trim().toLowerCase();
+  if (!m) return null;
+
+  // Clave SAT cruda ya capturada (p. ej. el portal manda "28").
+  if (FORMAS_PAGO_VALIDAS.has(m)) return m;
+
   if (m.includes("efectivo") || m.includes("cash")) return "01";
-  if (m.includes("tarjeta") && m.includes("créd")) return "04";
-  if (m.includes("tarjeta") && m.includes("déb")) return "28";
-  if (m.includes("transferencia") || m.includes("trans")) return "03";
-  return "01";
+  if (m.includes("transferencia") || m.includes("transfer") || m.includes("spei")) return "03";
+  // Débito / crédito, con o SIN la palabra "tarjeta", con o sin acento.
+  if (m.includes("déb") || m.includes("deb")) return "28";
+  if (m.includes("créd") || m.includes("cred")) return "04";
+
+  return null;
 };
 
 // ── Normalización del Nombre del receptor (decisión fiscal de Oscar) ──
@@ -89,7 +110,10 @@ export interface CfdiReceiver {
 export interface CfdiRequest {
   folio: string;
   fecha: string;
-  paymentMethod: string | null;
+  // Clave SAT c_FormaPago ya resuelta por el controlador (Grupo 2).
+  formaPago?: string;
+  // Compat/fallback: texto libre de la orden (se mapea si no llega formaPago).
+  paymentMethod?: string | null;
   receiver: CfdiReceiver;
   items: CfdiItem[];
   email: string;
@@ -177,11 +201,26 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   const isPublico = data.receiver.rfc.toUpperCase() === "XAXX010101000";
   const now = new Date();
 
+  // ── Forma de pago: usar la clave SAT ya resuelta; si no vino, intentar mapear
+  // el texto de la orden. NUNCA defaultear a Efectivo (defensa en profundidad):
+  // si no se puede determinar, se rechaza para exigir captura explícita aguas arriba.
+  const formaPago = isFormaPagoValida(data.formaPago)
+    ? data.formaPago
+    : mapPaymentForm(data.paymentMethod ?? null);
+
+  if (!isFormaPagoValida(formaPago)) {
+    throw new FacturamaRejectionError(
+      "No se pudo determinar la forma de pago (clave SAT c_FormaPago). " +
+      "Captura explícitamente cómo pagó el cliente antes de timbrar.",
+      400
+    );
+  }
+
   const body: Record<string, unknown> = {
     NameId: "1",
     Folio: data.folio,
     Date: data.fecha,
-    PaymentForm: mapPaymentForm(data.paymentMethod),
+    PaymentForm: formaPago,
     PaymentMethod: "PUE",
     ExpeditionPlace: process.env.FACTURAMA_CP ?? "76000",
     CfdiType: "I",

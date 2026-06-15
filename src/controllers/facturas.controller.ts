@@ -4,6 +4,8 @@ import { getPool, Sucursal } from "../db-sucursales.js";
 import {
   crearCfdi,
   validarReceptorSat,
+  mapPaymentForm,
+  isFormaPagoValida,
   FacturamaRejectionError,
   FacturamaUnavailableError,
 } from "../services/facturama.service.js";
@@ -11,6 +13,22 @@ import {
 const parseSucursal = (val: unknown): Sucursal | null => {
   if (val === "guerrero" || val === "madero") return val;
   return null;
+};
+
+/* Resuelve la clave SAT c_FormaPago con la que se debe timbrar.
+   Prioridad:
+     1) selección explícita válida del body (cliente/caja),
+     2) mapeo CONFIABLE de la orden — mapPaymentForm ya descarta "Pending",
+        null o ambiguo devolviendo null,
+     3) null → el llamador exige captura explícita (NUNCA defaultea a Efectivo). */
+const resolveFormaPago = (
+  orderPaymentMethod: string | null,
+  bodyFormaPago: unknown,
+): string | null => {
+  if (isFormaPagoValida(bodyFormaPago as string | null | undefined)) {
+    return bodyFormaPago as string;
+  }
+  return mapPaymentForm(orderPaymentMethod ?? null);
 };
 
 /* ══════════════════════════════════════════════════════════════
@@ -65,6 +83,10 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
       [orderId]
     ) as [Array<Record<string, any>>, unknown];
 
+    // Forma de pago derivable de la orden (null si viene "Pending"/ambigua):
+    // el portal usa paymentFormRequired para exigir captura explícita al cliente.
+    const paymentForm = resolveFormaPago(order.payment_method ?? null, null);
+
     res.json({
       order: {
         id:            order.id,
@@ -77,6 +99,8 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
         tax:           Number(order.tax),
         totalWithTax:  Number(order.total_with_tax),
         paymentMethod: order.payment_method,
+        paymentForm,
+        paymentFormRequired: paymentForm === null,
         tableName:     order.table_id ? `Mesa ${order.table_id}` : null,
         sucursal,
       },
@@ -104,7 +128,8 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
 ══════════════════════════════════════════════════════════════ */
 export const solicitarFactura = async (req: Request, res: Response): Promise<void> => {
   const { orderId, sucursal: sucursalRaw, rfc, razonSocial,
-          regimenFiscal, codigoPostal, usoCfdi, email } = req.body;
+          regimenFiscal, codigoPostal, usoCfdi, email,
+          formaPago: formaPagoBody } = req.body;
 
   const sucursal = parseSucursal(sucursalRaw);
   if (!sucursal) { res.status(400).json({ error: "Sucursal inválida." }); return; }
@@ -125,8 +150,8 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
 
   try {
     const [orderCheck] = await pool.query(
-      "SELECT id FROM orders WHERE id = ? LIMIT 1", [parseInt(orderId, 10)]
-    ) as [Array<unknown>, unknown];
+      "SELECT id, payment_method FROM orders WHERE id = ? LIMIT 1", [parseInt(orderId, 10)]
+    ) as [Array<Record<string, any>>, unknown];
     if (!orderCheck?.length) { res.status(404).json({ error: "Orden no encontrada." }); return; }
 
     const [dup] = await pool.query(
@@ -136,6 +161,18 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     ) as [Array<unknown>, unknown];
     if (dup?.length) {
       res.status(409).json({ error: "Ya existe una solicitud activa para esta orden." }); return;
+    }
+
+    // ── Forma de pago: resolver ANTES de crear la solicitud para no dejar
+    // registros colgados. Si no se puede determinar → 422 (NUNCA 201).
+    const formaPago = resolveFormaPago(orderCheck[0].payment_method ?? null, formaPagoBody);
+    if (formaPago === null) {
+      res.status(422).json({
+        ok: false, error: "forma_pago_requerida", reintentable: true,
+        message: "Indica la forma de pago con la que cubriste tu consumo para poder emitir tu factura.",
+        detail: null,
+      });
+      return;
     }
 
     // ── 1. Guardar solicitud ──────────────────────────────────
@@ -149,20 +186,14 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
 
     const solicitudId = result.insertId;
 
-    // ── 2. Obtener orden e items para timbrar ─────────────────
-    const [orderRows] = await pool.query(
-      `SELECT id, order_date, created_at, payment_method, total, tax, total_with_tax
-       FROM orders WHERE id = ? LIMIT 1`, [parseInt(orderId, 10)]
-    ) as [Array<Record<string, any>>, unknown];
-
+    // ── 2. Obtener items para timbrar ─────────────────────────
+    // (La orden y su forma de pago ya se resolvieron arriba; no se reconsulta.)
     const [itemRows] = await pool.query(
       `SELECT item_name, quantity, price AS subtotal,
               ROUND(price / quantity, 6) AS unit_price
        FROM order_items WHERE order_id = ? ORDER BY id`,
       [parseInt(orderId, 10)]
     ) as [Array<Record<string, any>>, unknown];
-
-    const order = (orderRows as any[])[0];
 
     // ── 3. Pre-validación del receptor contra el SAT (Grupo F) ────
     // Fail-open: si no se puede verificar (endpoint desactivado/caído) se procede a timbrar.
@@ -194,7 +225,7 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       const cfdi = await crearCfdi({
         folio: `${String(orderId).padStart(6, "0")}-${Date.now()}`,
         fecha:         fechaTimbrado,
-        paymentMethod: order.payment_method,
+        formaPago,
         receiver: {
           rfc:           rfc.toUpperCase(),
           razonSocial:   razonSocial.trim(),
@@ -295,10 +326,21 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
     const fechaTimbrado = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString().slice(0, 19);
     const order = (orderRows as any[])[0];
 
+    // Forma de pago: selección explícita (reintento de caja) > mapeo de la orden > null.
+    const formaPago = resolveFormaPago(order.payment_method ?? null, req.body?.formaPago);
+    if (formaPago === null) {
+      res.status(422).json({
+        ok: false, error: "forma_pago_requerida", reintentable: true,
+        message: "Indica la forma de pago con la que se cubrió el consumo para poder timbrar.",
+        detail: null,
+      });
+      return;
+    }
+
     const result = await crearCfdi({
       folio:         `${String(sol.order_id).padStart(6, "0")}-${Date.now()}`,
       fecha:         fechaTimbrado,
-      paymentMethod: order.payment_method,
+      formaPago,
       receiver: {
         rfc:           sol.rfc,
         razonSocial:   sol.razon_social,
