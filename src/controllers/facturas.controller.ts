@@ -4,8 +4,11 @@ import { getPool, Sucursal } from "../db-sucursales.js";
 import {
   crearCfdi,
   validarReceptorSat,
+  validarComboFiscal,
   mapPaymentForm,
   isFormaPagoValida,
+  RFC_PUBLICO_GENERAL,
+  PUBLICO_GENERAL,
   FacturamaRejectionError,
   FacturamaUnavailableError,
 } from "../services/facturama.service.js";
@@ -247,6 +250,17 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     res.status(400).json({ error: "Código postal inválido." }); return;
   }
 
+  // Coherencia fiscal local (régimen↔tipo de persona, uso↔régimen, XEXX no soportado):
+  // rechaza ANTES de timbrar lo que el PAC rechazaría, con mensaje accionable. El público
+  // general (XAXX) se exime aquí y se normaliza más abajo.
+  const combo = validarComboFiscal({ rfc: rfc.toUpperCase(), regimenFiscal, usoCfdi });
+  if (!combo.ok) {
+    res.status(422).json({
+      ok: false, error: combo.code, reintentable: true, message: combo.message, detail: null,
+    });
+    return;
+  }
+
   // ── Gate de acceso: mismo candado que getOrden. El cliente prueba posesión del ticket
   // (body.t / ?t=) y debe caer en la ventana vigente (mes natural por defecto); admin/caja
   // autenticado queda exento. Cualquier fallo → 404 genérico (no oráculo). Se SUMA a lo existente.
@@ -314,13 +328,22 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    // Público general (XAXX): normaliza a los valores forzados por el SAT para que el
+    // registro y el CFDI sean consistentes (el servicio los vuelve a forzar como defensa
+    // en profundidad, también en el camino admin /timbrar).
+    const esPublico = rfc.toUpperCase() === RFC_PUBLICO_GENERAL;
+    const razonEf   = esPublico ? PUBLICO_GENERAL.name          : razonSocial.trim();
+    const regimenEf = esPublico ? PUBLICO_GENERAL.regimenFiscal : regimenFiscal;
+    const usoEf     = esPublico ? PUBLICO_GENERAL.usoCfdi        : usoCfdi;
+    const cpEf      = esPublico ? (process.env.FACTURAMA_CP ?? "76000") : codigoPostal;
+
     // ── 1. Guardar solicitud ──────────────────────────────────
     const [result] = await pool.query(
       `INSERT INTO factura_requests
          (order_id, rfc, razon_social, regimen_fiscal, codigo_postal, uso_cfdi, email)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [parseInt(orderId, 10), rfc.toUpperCase(), razonSocial.trim(),
-       regimenFiscal, codigoPostal, usoCfdi, email.toLowerCase().trim()]
+      [parseInt(orderId, 10), rfc.toUpperCase(), razonEf,
+       regimenEf, cpEf, usoEf, email.toLowerCase().trim()]
     ) as [import("mysql2").ResultSetHeader, unknown];
 
     const solicitudId = result.insertId;
@@ -367,8 +390,10 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
         formaPago,
         receiver: {
           rfc:           rfc.toUpperCase(),
-          razonSocial:   razonSocial.trim(),
-          regimenFiscal, codigoPostal, usoCfdi,
+          razonSocial:   razonEf,
+          regimenFiscal: regimenEf,
+          codigoPostal:  cpEf,
+          usoCfdi:       usoEf,
         },
         items: (itemRows as any[]).map(i => ({
           dishName:  i.item_name,

@@ -53,6 +53,89 @@ export const mapPaymentForm = (method: string | null): string | null => {
 export const normalizeReceiverName = (raw: string): string =>
   (raw ?? "").replace(/\s+/g, " ").trim().toUpperCase();
 
+// ── Validación fiscal local del receptor (sin llamar al SAT) ─────────────────────
+// Matriz confirmada por legal-fiscal (2026-06-15) contra c_RegimenFiscal y c_UsoCFDI
+// del Anexo 20 CFDI 4.0, filtrada a los catálogos que ofrece el portal. El objetivo es
+// rechazar combinaciones inválidas ANTES de timbrar y no dejárselas al PAC.
+export const RFC_PUBLICO_GENERAL = "XAXX010101000";
+export const RFC_EXTRANJERO      = "XEXX010101000";
+
+// Valores que SIEMPRE se fuerzan para el receptor público en general (XAXX).
+// "PUBLICO EN GENERAL" va SIN acento: el genérico no se valida contra padrón y los PAC
+// esperan esa cadena exacta (por eso NO pasa por normalizeReceiverName).
+export const PUBLICO_GENERAL = {
+  name:          "PUBLICO EN GENERAL",
+  usoCfdi:       "S01",
+  regimenFiscal: "616",
+} as const;
+
+// Régimen receptor admisible por tipo de persona (longitud de RFC: 13=física, 12=moral).
+const REGIMENES_MORAL  = new Set(["601", "603", "616", "626"]);
+const REGIMENES_FISICA = new Set(["605", "606", "608", "612", "614", "616", "625", "626"]);
+
+// Uso CFDI → regímenes receptores con los que es válido (subset del portal).
+const USO_REGIMENES_VALIDOS: Record<string, string[]> = {
+  G01:  ["601", "603", "606", "612", "625", "626"],
+  G02:  ["601", "603", "606", "612", "625", "626"],
+  G03:  ["601", "603", "605", "606", "608", "612", "616", "625", "626"],
+  I01:  ["601", "606", "612", "625", "626"],
+  I04:  ["601", "606", "612", "625", "626"],
+  D01:  ["605", "606", "608", "612", "614", "616", "625", "626"],
+  D03:  ["605", "606", "608", "612", "614", "616", "625", "626"],
+  D10:  ["605", "606", "608", "612", "614", "616", "625", "626"],
+  S01:  ["601", "603", "605", "606", "608", "612", "614", "616", "625", "626"],
+  CP01: ["601", "603", "605", "606", "608", "612", "614", "616", "625", "626"],
+};
+
+export interface ComboFiscalInput { rfc: string; regimenFiscal: string; usoCfdi: string; }
+export type ComboFiscalResult =
+  | { ok: true }
+  | { ok: false; code: string; message: string };
+
+// Valida coherencia receptor↔régimen↔uso. El público en general (XAXX) se exime: sus
+// valores se fuerzan en crearCfdi. El genérico extranjero (XEXX) se rechaza (faltan
+// ResidenciaFiscal/NumRegIdTrib que el portal no captura).
+export function validarComboFiscal(input: ComboFiscalInput): ComboFiscalResult {
+  const rfc = (input.rfc ?? "").toUpperCase().trim();
+  const { regimenFiscal, usoCfdi } = input;
+
+  if (rfc === RFC_PUBLICO_GENERAL) return { ok: true }; // valores forzados aguas abajo
+  if (rfc === RFC_EXTRANJERO) {
+    return {
+      ok: false, code: "rfc_extranjero",
+      message: "La facturación a RFC genérico extranjero (XEXX010101000) no está disponible en este portal. Escríbenos a info@lapeñadesantiago.com para emitir tu comprobante.",
+    };
+  }
+
+  const esFisica = rfc.length === 13;
+  const esMoral  = rfc.length === 12;
+  if (!esFisica && !esMoral) {
+    return { ok: false, code: "rfc_invalido", message: "El RFC no tiene una longitud válida (12 para persona moral, 13 para persona física)." };
+  }
+
+  const regimenesPersona = esMoral ? REGIMENES_MORAL : REGIMENES_FISICA;
+  if (!regimenesPersona.has(regimenFiscal)) {
+    return {
+      ok: false, code: "regimen_persona",
+      message: esMoral
+        ? "El régimen fiscal seleccionado no aplica a personas morales (RFC de 12 caracteres). Verifica tu Constancia de Situación Fiscal."
+        : "El régimen fiscal seleccionado no aplica a personas físicas (RFC de 13 caracteres). Verifica tu Constancia de Situación Fiscal.",
+    };
+  }
+
+  const usosValidos = USO_REGIMENES_VALIDOS[usoCfdi];
+  if (!usosValidos) {
+    return { ok: false, code: "uso_desconocido", message: "El Uso de CFDI seleccionado no es válido." };
+  }
+  if (!usosValidos.includes(regimenFiscal)) {
+    return {
+      ok: false, code: "uso_regimen",
+      message: "El Uso de CFDI no es compatible con tu régimen fiscal. Elige un uso permitido para tu régimen (p. ej. «Gastos en general, G03») o corrige tu régimen.",
+    };
+  }
+  return { ok: true };
+}
+
 // ── Errores tipados para distinguir "rechazo del SAT/PAC" de "servicio caído" ──
 // Grupo C/H: el controlador los traduce a 422 (rechazo accionable) vs 503 (reintenta luego).
 export class FacturamaRejectionError extends Error {
@@ -226,8 +309,29 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     };
   });
 
-  const isPublico = data.receiver.rfc.toUpperCase() === "XAXX010101000";
+  const isPublico = data.receiver.rfc.toUpperCase() === RFC_PUBLICO_GENERAL;
   const now = new Date();
+  const expeditionCp = process.env.FACTURAMA_CP ?? "76000";
+
+  // Receptor: para público en general (XAXX) se FUERZAN los valores obligatorios del SAT
+  // (Uso S01, Régimen 616, DomicilioFiscalReceptor = CP del emisor, Nombre genérico sin
+  // acento). Para cualquier otro receptor, los datos capturados (ya validados aguas arriba).
+  const receiver = isPublico
+    ? {
+        Rfc:          RFC_PUBLICO_GENERAL,
+        Name:         PUBLICO_GENERAL.name,
+        CfdiUse:      PUBLICO_GENERAL.usoCfdi,
+        FiscalRegime: PUBLICO_GENERAL.regimenFiscal,
+        TaxZipCode:   expeditionCp,
+      }
+    : {
+        Rfc:          data.receiver.rfc.toUpperCase(),
+        // Grupo A: solo MAYÚSCULAS + espacios colapsados, CONSERVANDO acentos y Ñ.
+        Name:         normalizeReceiverName(data.receiver.razonSocial),
+        CfdiUse:      data.receiver.usoCfdi,
+        FiscalRegime: data.receiver.regimenFiscal,
+        TaxZipCode:   data.receiver.codigoPostal,
+      };
 
   // ── Forma de pago: usar la clave SAT ya resuelta; si no vino, intentar mapear
   // el texto de la orden. NUNCA defaultear a Efectivo (defensa en profundidad):
@@ -250,7 +354,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     Date: data.fecha,
     PaymentForm: formaPago,
     PaymentMethod: "PUE",
-    ExpeditionPlace: process.env.FACTURAMA_CP ?? "76000",
+    ExpeditionPlace: expeditionCp,
     CfdiType: "I",
     Currency: "MXN",
     ...(isPublico ? {
@@ -260,14 +364,7 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
         Year: String(now.getFullYear()),
       }
     } : {}),
-    Receiver: {
-      Rfc: data.receiver.rfc.toUpperCase(),
-      // Grupo A: solo MAYÚSCULAS + espacios colapsados, CONSERVANDO acentos y Ñ.
-      Name: normalizeReceiverName(data.receiver.razonSocial),
-      CfdiUse: data.receiver.usoCfdi,
-      FiscalRegime: data.receiver.regimenFiscal,
-      TaxZipCode: data.receiver.codigoPostal,
-    },
+    Receiver: receiver,
     Items: items,
   };
 
