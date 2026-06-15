@@ -7,6 +7,9 @@ import {
   validarComboFiscal,
   mapPaymentForm,
   isFormaPagoValida,
+  enviarCfdiEmail,
+  descargarCfdiDoc,
+  parseCfdiNotas,
   RFC_PUBLICO_GENERAL,
   PUBLICO_GENERAL,
   FacturamaRejectionError,
@@ -191,9 +194,18 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
     // el portal usa paymentFormRequired para exigir captura explícita al cliente.
     const paymentForm = resolveFormaPago(order.payment_method ?? null, null);
 
-    // Sin `alreadyRequested`: se elimina el oráculo de existencia. La protección
-    // antiduplicado vive en /solicitar (responde 409 al timbrar de nuevo).
+    // Factura ya emitida (Gap B): se devuelve SOLO porque este camino YA exigió token
+    // válido del ticket (no es un oráculo de enumeración). El portal la usa para ofrecer
+    // descarga/reenvío en vez del callejón 409. Fantasmas (notas sin UUID) → null.
+    const [factRows] = await pool.query(
+      `SELECT notas FROM factura_requests
+       WHERE order_id = ? AND status = 'procesada' ORDER BY id DESC LIMIT 1`,
+      [orderId]
+    ) as [Array<Record<string, any>>, unknown];
+    const cfdiInfo = factRows?.length ? parseCfdiNotas(factRows[0].notas) : null;
+
     res.json({
+      factura: cfdiInfo ? { uuid: cfdiInfo.uuid } : null,
       order: {
         id:            order.id,
         folio:         String(order.id).padStart(6, "0"),
@@ -404,15 +416,18 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
         email: email.toLowerCase().trim(),
       });
 
-      // Camino de ÉXITO — NO se modifica: procesada + UUID real
+      // Camino de ÉXITO: procesada + UUID real + estado REAL del correo (Gap A).
       await pool.query(
         `UPDATE factura_requests SET status = 'procesada', notas = ? WHERE id = ?`,
-        [`CFDI: ${cfdi.uuid} | ID: ${cfdi.cfdiId}`, solicitudId]
+        [`CFDI: ${cfdi.uuid} | ID: ${cfdi.cfdiId} | email:${cfdi.emailSent ? "ok" : "pendiente"}`, solicitudId]
       );
 
       res.status(201).json({
         success: true, solicitudId, uuid: cfdi.uuid,
-        message: `Factura timbrada y enviada a ${email}.`,
+        emailEnviado: cfdi.emailSent,
+        message: cfdi.emailSent
+          ? `Factura timbrada y enviada a ${email}.`
+          : "Factura timbrada. No pudimos confirmar el envío a tu correo; descárgala o reenvíala desde aquí.",
       });
 
     } catch (factuErr: any) {
@@ -523,14 +538,17 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
 
     await pool.query(
       `UPDATE factura_requests SET status = 'procesada', notas = ? WHERE id = ?`,
-      [`CFDI: ${result.uuid} | ID: ${result.cfdiId}`, solicitudId]
+      [`CFDI: ${result.uuid} | ID: ${result.cfdiId} | email:${result.emailSent ? "ok" : "pendiente"}`, solicitudId]
     );
 
     res.json({
       success:  true,
       uuid:     result.uuid,
       cfdiId:   result.cfdiId,
-      message:  `Factura timbrada y enviada a ${sol.email}`,
+      emailEnviado: result.emailSent,
+      message:  result.emailSent
+        ? `Factura timbrada y enviada a ${sol.email}`
+        : "Factura timbrada. No se pudo confirmar el envío del correo; usa la descarga o el reenvío.",
     });
 
   } catch (err: any) {
@@ -557,5 +575,115 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
       return;
     }
     res.status(500).json({ ok: false, error: "error_interno", message: "Error al timbrar." });
+  }
+};
+
+/* ══════════════════════════════════════════════════════════════
+   Reobtención de una factura YA emitida (Gap B) — descarga y reenvío.
+   🔒 MISMO candado que el camino cliente: token del ticket + sucursal + folio + lockout
+   por IP/folio + rate-limit (en la ruta). NUNCA re-timbra: opera sobre el CfdiId existente
+   en Facturama. Matiz: SIN ventana de facturación (la factura ya existe; el cliente puede
+   reobtenerla cuando sea con su código). Admin/caja autenticado queda exento del token.
+══════════════════════════════════════════════════════════════ */
+
+// Enmascara el correo para devolverlo sin exponerlo completo (j****@dominio.com).
+const maskEmail = (email: string): string => {
+  const [user, domain] = String(email ?? "").split("@");
+  if (!domain) return "tu correo";
+  return `${user.slice(0, 1)}${"*".repeat(Math.max(user.length - 1, 1))}@${domain}`;
+};
+
+// Verifica posesión del ticket SIN ventana y localiza la factura emitida. Devuelve sus
+// identificadores, o responde (400/404/429) y devuelve null (todo fallo colapsa al 404).
+async function gateFacturaEmitida(
+  req: Request, res: Response,
+): Promise<{ cfdiId: string; uuid: string; email: string } | null> {
+  const orderId  = parseInt(req.params.orderId, 10);
+  const sucursal = parseSucursal(req.query.sucursal ?? req.body?.sucursal);
+  const token    = getTicketToken(req.query.t ?? req.body?.t);
+  const isAdmin  = isAdminRequest(req);
+
+  const notFound = () => res.status(404).json({
+    error: "No encontramos tu factura. Escanea el QR o teclea el código de tu ticket.",
+  });
+
+  if (!sucursal) { res.status(400).json({ error: "Sucursal requerida (guerrero o madero)." }); return null; }
+  if (isNaN(orderId) || orderId <= 0) { notFound(); return null; }
+  if (!isAdmin && !token) { notFound(); return null; }
+
+  const ip = clientIp(req);
+  if (!isAdmin) {
+    const lock = checkAccessLock(ip, sucursal, orderId);
+    if (lock.blocked) { tooManyAttempts(res, lock.retryAfterSec); return null; }
+  }
+
+  const pool = getPool(sucursal);
+
+  // Posesión del ticket SIN ventana (la factura ya existe). Mismo no-oráculo: todo al 404.
+  if (!isAdmin) {
+    const [okRows] = await pool.query(
+      `SELECT id FROM orders WHERE id = ? AND factura_token = ? LIMIT 1`, [orderId, token]
+    ) as [Array<unknown>, unknown];
+    if (!okRows?.length) { registerAccessFailure(ip, sucursal, orderId); notFound(); return null; }
+    resetAccessFailures(ip, sucursal, orderId);
+  }
+
+  const [factRows] = await pool.query(
+    `SELECT email, notas FROM factura_requests
+     WHERE order_id = ? AND status = 'procesada' ORDER BY id DESC LIMIT 1`, [orderId]
+  ) as [Array<Record<string, any>>, unknown];
+  const info = factRows?.length ? parseCfdiNotas(factRows[0].notas) : null;
+  if (!info) { notFound(); return null; }
+
+  return { cfdiId: info.cfdiId, uuid: info.uuid, email: factRows[0].email };
+}
+
+/* GET /api/facturas/factura/:orderId/documento?sucursal=&t=&formato=pdf|xml */
+export const descargarFactura = async (req: Request, res: Response): Promise<void> => {
+  const formato = req.query.formato === "xml" ? "xml" : "pdf";
+  try {
+    const gate = await gateFacturaEmitida(req, res);
+    if (!gate) return; // gateFacturaEmitida ya respondió
+
+    const contenido = await descargarCfdiDoc(gate.cfdiId, formato);
+    if (!contenido) {
+      res.status(502).json({ ok: false, error: "documento_vacio", message: "El documento no está disponible por ahora. Intenta de nuevo en un momento." });
+      return;
+    }
+    res.json({
+      ok: true, formato, contenido,
+      filename: `factura-${String(req.params.orderId).padStart(6, "0")}.${formato}`,
+    });
+  } catch (err: any) {
+    if (err instanceof FacturamaUnavailableError) {
+      res.status(503).json({ ok: false, error: "facturama_no_disponible", message: "El servicio de facturación no está disponible. Intenta en unos minutos." });
+      return;
+    }
+    console.error(`[facturas] descargarFactura error formato=${formato}:`, err?.name ?? "Error");
+    res.status(500).json({ ok: false, error: "error_interno", message: "No pudimos generar tu documento." });
+  }
+};
+
+/* POST /api/facturas/factura/:orderId/reenviar?sucursal=&t= */
+export const reenviarFactura = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const gate = await gateFacturaEmitida(req, res);
+    if (!gate) return; // gateFacturaEmitida ya respondió
+
+    // Reenvío SIEMPRE al correo registrado de la solicitud (no se acepta destino arbitrario
+    // → no es un relay abierto). NO re-timbra: usa el CfdiId existente.
+    const enviado = await enviarCfdiEmail(gate.cfdiId, gate.email);
+    if (!enviado) {
+      res.status(502).json({ ok: false, error: "email_no_confirmado", message: "No pudimos confirmar el reenvío. Intenta de nuevo o descarga tu factura." });
+      return;
+    }
+    res.json({ ok: true, email: maskEmail(gate.email), message: `Te reenviamos tu factura a ${maskEmail(gate.email)}.` });
+  } catch (err: any) {
+    if (err instanceof FacturamaUnavailableError) {
+      res.status(503).json({ ok: false, error: "facturama_no_disponible", message: "El servicio de facturación no está disponible. Intenta en unos minutos." });
+      return;
+    }
+    console.error("[facturas] reenviarFactura error:", err?.name ?? "Error");
+    res.status(500).json({ ok: false, error: "error_interno", message: "No pudimos reenviar tu factura." });
   }
 };

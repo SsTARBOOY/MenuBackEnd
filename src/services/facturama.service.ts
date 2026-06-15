@@ -208,6 +208,43 @@ export interface CfdiResult {
   folio: string;
   pdfBase64: string;
   xmlBase64: string;
+  emailSent: boolean;   // true SOLO si Facturama confirmó (2xx) el envío del correo
+}
+
+// ── Reenvío y descarga de un CFDI YA emitido (Gap A/B) ───────────────────────────
+// Reutilizables por crearCfdi (al timbrar) y por los endpoints de reobtención. NO
+// re-timbran: operan sobre el CfdiId existente en Facturama.
+
+// Envía (o reenvía) el CFDI por correo. Devuelve true SOLO si Facturama respondió 2xx.
+// Lanza FacturamaUnavailableError ante caída/timeout de red (el llamador decide).
+export async function enviarCfdiEmail(cfdiId: string, email: string): Promise<boolean> {
+  const url = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(email)}`;
+  const res = await facturamaFetch(url, { method: "POST", headers: { Authorization: getAuth() } });
+  return res.ok;
+}
+
+// Descarga el PDF o XML (base64) del CFDI ya emitido. 5xx/408 → no disponible (503);
+// otro error → rechazo. Lanza FacturamaUnavailableError ante caída de red.
+export async function descargarCfdiDoc(cfdiId: string, formato: "pdf" | "xml"): Promise<string> {
+  const res = await facturamaFetch(
+    `${API_URL}/Cfdi/${formato}/issued/${encodeURIComponent(cfdiId)}`,
+    { headers: { Authorization: getAuth() } }
+  );
+  if (!res.ok) {
+    if (res.status >= 500 || res.status === 408) throw new FacturamaUnavailableError(`HTTP ${res.status}`);
+    throw new FacturamaRejectionError(`No se pudo obtener el ${formato.toUpperCase()} (HTTP ${res.status}).`, res.status);
+  }
+  return ((await res.json()) as { Content?: string }).Content ?? "";
+}
+
+// Extrae { uuid, cfdiId } de la nota "CFDI: <uuid> | ID: <cfdiId> [| email:...]".
+// Devuelve null si la nota es de una fantasma (sin UUID o ID 'undefined').
+export function parseCfdiNotas(notas: string | null | undefined): { uuid: string; cfdiId: string } | null {
+  if (!notas) return null;
+  const uuid   = notas.match(/CFDI:\s*([0-9A-Fa-f-]{36})/)?.[1];
+  const cfdiId = notas.match(/ID:\s*([^\s|]+)/)?.[1];
+  if (!uuid || !cfdiId || cfdiId === "undefined") return null;
+  return { uuid, cfdiId };
 }
 
 // ── Grupo F: pre-validación del receptor contra el SAT (scaffold fail-open) ──
@@ -409,23 +446,19 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
 
   // ── 2-4. Descargas y email: NO deben tumbar el éxito ya timbrado ──
   // (CFDI ya tiene UUID; PDF/XML/email son secundarios → fail-soft, nunca throw.)
+  // emailSent se reporta arriba para NO afirmar "enviada" si Facturama no confirmó (Gap A).
   let pdfData = "";
   let xmlData = "";
-  try {
-    const pdfRes = await facturamaFetch(`${API_URL}/Cfdi/pdf/issued/${cfdiId}`, { headers: { "Authorization": getAuth() } });
-    if (pdfRes.ok) pdfData = ((await pdfRes.json()) as { Content: string }).Content;
-  } catch (e: any) { console.warn("[Facturama] PDF no disponible:", e?.name ?? "error"); }
+  let emailSent = false;
+  try { pdfData = await descargarCfdiDoc(cfdiId, "pdf"); }
+  catch (e: any) { console.warn("[Facturama] PDF no disponible:", e?.name ?? "error"); }
+
+  try { xmlData = await descargarCfdiDoc(cfdiId, "xml"); }
+  catch (e: any) { console.warn("[Facturama] XML no disponible:", e?.name ?? "error"); }
 
   try {
-    const xmlRes = await facturamaFetch(`${API_URL}/Cfdi/xml/issued/${cfdiId}`, { headers: { "Authorization": getAuth() } });
-    if (xmlRes.ok) xmlData = ((await xmlRes.json()) as { Content: string }).Content;
-  } catch (e: any) { console.warn("[Facturama] XML no disponible:", e?.name ?? "error"); }
-
-  try {
-    // Endpoint: POST /cfdi?CfdiType=issued&CfdiId={id}&Email={email}  (query params, NO body)
-    const emailUrl = `${API_URL}/cfdi?CfdiType=issued&CfdiId=${encodeURIComponent(cfdiId)}&Email=${encodeURIComponent(data.email)}`;
-    const emailRes = await facturamaFetch(emailUrl, { method: "POST", headers: { "Authorization": getAuth() } });
-    if (!emailRes.ok) console.warn("[Facturama] Email warning:", emailRes.status);
+    emailSent = await enviarCfdiEmail(cfdiId, data.email);
+    if (!emailSent) console.warn("[Facturama] Email no confirmado por el PAC");
   } catch (e: any) { console.warn("[Facturama] Email no enviado:", e?.name ?? "error"); }
 
   return {
@@ -434,5 +467,6 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     folio: cfdi.Folio,
     pdfBase64: pdfData,
     xmlBase64: xmlData,
+    emailSent,
   };
 }

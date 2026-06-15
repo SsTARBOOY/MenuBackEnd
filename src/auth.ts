@@ -90,6 +90,37 @@ export function solicitarRateLimit(req: Request, res: Response, next: NextFuncti
   next();
 }
 
+// ── Rate-limit para reobtención de factura (descarga/reenvío, Gap B) ────────────
+// Más holgado que /solicitar (un cliente puede bajar PDF + XML + reenviar en una visita).
+// El candado real anti-fuerza-bruta del código corto sigue siendo el lockout por IP+folio
+// (checkAccessLock); esto solo acota el abuso del envío de correo y de la descarga.
+const reobtencionHits = new Map<string, { count: number; resetAt: number }>();
+const REOBT_MAX       = Number(process.env.REOBT_RATE_MAX ?? "20");
+const REOBT_WINDOW_MS = Number(process.env.REOBT_RATE_WINDOW_MS ?? String(3_600_000));
+
+export function reobtencionRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const ip  = clientIp(req);
+  const now = Date.now();
+  // Barrido perezoso para que el Map no crezca sin límite (atiende el backlog del leak).
+  if (reobtencionHits.size > 5000) {
+    for (const [k, e] of reobtencionHits) if (now > e.resetAt) reobtencionHits.delete(k);
+  }
+  const entry = reobtencionHits.get(ip);
+  if (!entry || now > entry.resetAt) {
+    reobtencionHits.set(ip, { count: 1, resetAt: now + REOBT_WINDOW_MS });
+    next(); return;
+  }
+  if (entry.count >= REOBT_MAX) {
+    res.status(429).json({
+      ok: false, error: "rate_limit",
+      message: "Demasiadas solicitudes. Espera unos minutos e intenta de nuevo.",
+    });
+    return;
+  }
+  entry.count++;
+  next();
+}
+
 // ── Lockout por FALLOS para el código del ticket (GA) ──────────────────────────
 // Defensa que sostiene la seguridad del código corto (8 chars ≈ 40 bits). Se cuentan
 // SOLO los fallos (código equivocado/ausente en el camino cliente); el éxito limpia.
