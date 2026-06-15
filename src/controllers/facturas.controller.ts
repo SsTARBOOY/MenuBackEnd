@@ -9,10 +9,71 @@ import {
   FacturamaRejectionError,
   FacturamaUnavailableError,
 } from "../services/facturama.service.js";
+import {
+  verifyToken,
+  clientIp,
+  checkAccessLock,
+  registerAccessFailure,
+  resetAccessFailures,
+} from "../auth.js";
 
 const parseSucursal = (val: unknown): Sucursal | null => {
   if (val === "guerrero" || val === "madero") return val;
   return null;
+};
+
+// Detecta admin/caja autenticado SIN bloquear (a diferencia de requireAdmin, no responde).
+// El camino cliente sigue de largo a la validación por token; el admin queda exento.
+const isAdminRequest = (req: Request): boolean => {
+  const auth = req.headers.authorization ?? "";
+  if (!auth.startsWith("Bearer ")) return false;
+  const data = verifyToken(auth.slice(7));
+  return !!data && data.rol === "admin";
+};
+
+// Lee y NORMALIZA el código del ticket (?t=… o tecleado): MAYÚSCULAS, sin guion ni
+// espacios. Acepta el QR (canónico) y el tecleo "abcd-2345" por igual. Arrays/ausente => "".
+const getTicketToken = (val: unknown): string =>
+  typeof val === "string" ? val.trim().toUpperCase().replace(/[^0-9A-Z]/g, "") : "";
+
+// 429 genérico de lockout (no revela si el folio existe).
+const tooManyAttempts = (res: Response, retryAfterSec: number): void => {
+  if (retryAfterSec > 0) res.setHeader("Retry-After", String(retryAfterSec));
+  res.status(429).json({
+    ok: false, error: "demasiados_intentos",
+    message: "Demasiados intentos. Espera unos minutos e intenta de nuevo.",
+  });
+};
+
+// ── Ventana de autoservicio (camino cliente) ───────────────────────────────────
+// Política por defecto: la orden debe ser del MES NATURAL en curso (hasta fin de mes).
+// Usa order_date — created_at está NULL al 100% en orders (diagnóstico 2026-06-15).
+// Admin/caja exento. Configurable por env sin recompilar:
+//   FACT_VENTANA_MODO     = "mes" (default) | "dias"
+//   FACT_VENTANA_DIAS     = N (solo modo "dias"; default 30)
+//   FACT_TZ_OFFSET_HORAS  = 6 (MX = UTC-6, sin horario de verano)
+// ⚠️ order_date se guarda en hora MX y la TZ de sesión de la BD es UTC (confirmado), por
+//    eso "ahora MX" = UTC_TIMESTAMP() − 6h (independiente de @@session.time_zone).
+const VENTANA_MODO = (process.env.FACT_VENTANA_MODO ?? "mes").toLowerCase();
+const VENTANA_DIAS = Number(process.env.FACT_VENTANA_DIAS ?? "30");
+const TZ_OFFSET_HORAS = (() => {
+  const n = Number(process.env.FACT_TZ_OFFSET_HORAS ?? "6");
+  return Number.isFinite(n) ? n : 6;
+})();
+const MX_NOW = `(UTC_TIMESTAMP() - INTERVAL ${TZ_OFFSET_HORAS} HOUR)`;
+
+// Fragmento SQL (con placeholders) + params para la ventana sobre order_date (hora MX).
+const ventanaSql = (): { clause: string; params: Array<number> } => {
+  if (VENTANA_MODO === "dias") {
+    return { clause: `order_date >= (${MX_NOW} - INTERVAL ? DAY)`, params: [VENTANA_DIAS] };
+  }
+  // "mes": [primer día del mes en curso (MX), primer día del mes siguiente).
+  return {
+    clause:
+      `order_date >= DATE_FORMAT(${MX_NOW}, '%Y-%m-01') ` +
+      `AND order_date < (DATE_FORMAT(${MX_NOW}, '%Y-%m-01') + INTERVAL 1 MONTH)`,
+    params: [],
+  };
 };
 
 /* Resuelve la clave SAT c_FormaPago con la que se debe timbrar.
@@ -37,35 +98,81 @@ const resolveFormaPago = (
 export const getOrden = async (req: Request, res: Response): Promise<void> => {
   const orderId  = parseInt(req.params.id, 10);
   const sucursal = parseSucursal(req.query.sucursal);
+  const token    = getTicketToken(req.query.t);
+  const isAdmin  = isAdminRequest(req);
+
+  // Respuesta GENÉRICA del camino cliente: jamás revela si el folio existe, si el token
+  // es malo o si está fuera de la ventana. Todos los fallos colapsan al mismo 404.
+  const notFound = () => {
+    res.status(404).json({
+      error: "No encontramos tu orden. Escanea el QR de tu ticket para facturar.",
+    });
+  };
 
   if (isNaN(orderId) || orderId <= 0) {
-    res.status(400).json({ error: "Folio inválido." }); return;
+    if (isAdmin) { res.status(400).json({ error: "Folio inválido." }); return; }
+    notFound(); return;
   }
   if (!sucursal) {
     res.status(400).json({ error: "Sucursal requerida (guerrero o madero)." }); return;
   }
+  // Cliente: sin token no se abre nada (no se distingue de folio inexistente).
+  if (!isAdmin && !token) { notFound(); return; }
+
+  // Lockout (solo cliente): si está bloqueado por IP o por folio → 429 ANTES de tocar la BD.
+  const ip = clientIp(req);
+  if (!isAdmin) {
+    const lock = checkAccessLock(ip, sucursal, orderId);
+    if (lock.blocked) { tooManyAttempts(res, lock.retryAfterSec); return; }
+  }
 
   const pool = getPool(sucursal);
+  const cols = `id, name, guests, order_status, order_date,
+                total, tax, total_with_tax, payment_method, created_at, table_id`;
 
   try {
-    const [orderRows] = await pool.query(
-      `SELECT id, name, phone, guests, order_status, order_date,
-              total, tax, total_with_tax, payment_method, created_at, table_id
-       FROM orders WHERE id = ? LIMIT 1`,
-      [orderId]
-    ) as [Array<Record<string, any>>, unknown];
+    let orderRows: Array<Record<string, any>>;
+
+    if (isAdmin) {
+      // Admin/caja autenticado: exento de token y de la ventana (remediar/retimbrar).
+      [orderRows] = await pool.query(
+        `SELECT ${cols} FROM orders WHERE id = ? LIMIT 1`, [orderId]
+      ) as [Array<Record<string, any>>, unknown];
+    } else {
+      // Cliente: token + ventana (mes natural en curso, por defecto) en UNA consulta →
+      // match/no-match indistinguible. Sobre order_date en hora MX (ver ventanaSql).
+      const win = ventanaSql();
+      [orderRows] = await pool.query(
+        `SELECT ${cols} FROM orders
+         WHERE id = ? AND factura_token = ? AND ${win.clause} LIMIT 1`,
+        [orderId, token, ...win.params]
+      ) as [Array<Record<string, any>>, unknown];
+    }
 
     if (!orderRows?.length) {
-      res.status(404).json({ error: "No se encontró ninguna orden con ese folio." }); return;
+      // Fallo de acceso del cliente (token malo / fuera de ventana / folio inexistente):
+      // todos cuentan igual, sin oráculo. Admin no cuenta.
+      if (!isAdmin) registerAccessFailure(ip, sucursal, orderId);
+      notFound(); return;
     }
+
+    // Token válido → reset INMEDIATO. Los errores posteriores (estatus, etc.) NO cuentan
+    // como fallo de acceso.
+    if (!isAdmin) resetAccessFailures(ip, sucursal, orderId);
 
     const order = orderRows[0];
     const validStatuses = ["completed","paid","completada","pagada","pagado","cerrada","closed"];
 
     if (!validStatuses.includes((order.order_status ?? "").toString().toLowerCase())) {
-      res.status(422).json({
-        error: `La orden #${orderId} tiene estatus "${order.order_status}" y no puede facturarse todavía.`,
-      }); return;
+      // Admin recibe el motivo real; cliente recibe el 404 genérico (no se revela existencia).
+      if (isAdmin) {
+        res.status(422).json({
+          error: `La orden #${orderId} tiene estatus "${order.order_status}" y no puede facturarse todavía.`,
+        });
+      } else {
+        notFound();
+      }
+      return;
     }
 
     const [itemRows] = await pool.query(
@@ -77,16 +184,12 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
       [orderId]
     ) as [Array<Record<string, any>>, unknown];
 
-    const [existing] = await pool.query(
-      `SELECT id, status FROM factura_requests
-       WHERE order_id = ? AND status IN ('pendiente','procesada') LIMIT 1`,
-      [orderId]
-    ) as [Array<Record<string, any>>, unknown];
-
     // Forma de pago derivable de la orden (null si viene "Pending"/ambigua):
     // el portal usa paymentFormRequired para exigir captura explícita al cliente.
     const paymentForm = resolveFormaPago(order.payment_method ?? null, null);
 
+    // Sin `alreadyRequested`: se elimina el oráculo de existencia. La protección
+    // antiduplicado vive en /solicitar (responde 409 al timbrar de nuevo).
     res.json({
       order: {
         id:            order.id,
@@ -112,11 +215,9 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
         subtotal:  Number(i.subtotal),
         notes:     i.notes ?? null,
       })),
-      alreadyRequested: existing?.length
-        ? { id: existing[0].id, status: existing[0].status }
-        : null,
     });
   } catch (err) {
+    // No se registra el token ni datos del cliente; solo el error del motor.
     console.error("[facturas] getOrden error:", err);
     res.status(500).json({ error: "Error interno al consultar la orden." });
   }
@@ -146,9 +247,47 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     res.status(400).json({ error: "Código postal inválido." }); return;
   }
 
+  // ── Gate de acceso: mismo candado que getOrden. El cliente prueba posesión del ticket
+  // (body.t / ?t=) y debe caer en la ventana vigente (mes natural por defecto); admin/caja
+  // autenticado queda exento. Cualquier fallo → 404 genérico (no oráculo). Se SUMA a lo existente.
+  const token    = getTicketToken(req.body?.t ?? req.query.t);
+  const isAdmin  = isAdminRequest(req);
+  const notFound = () => {
+    res.status(404).json({
+      error: "No encontramos tu orden. Escanea el QR de tu ticket para facturar.",
+    });
+  };
+  if (!isAdmin && !token) { notFound(); return; }
+
+  // Lockout (solo cliente): si está bloqueado por IP o por folio → 429 ANTES de tocar la BD.
+  const ip = clientIp(req);
+  if (!isAdmin) {
+    const lock = checkAccessLock(ip, sucursal, parseInt(orderId, 10));
+    if (lock.blocked) { tooManyAttempts(res, lock.retryAfterSec); return; }
+  }
+
   const pool = getPool(sucursal);
 
   try {
+    // El gate va PRIMERO: antes de la resolución de forma de pago, el insert o el timbrado.
+    // Para el cliente también cierra los oráculos de orderCheck (404) y dup (409) de abajo.
+    if (!isAdmin) {
+      const win = ventanaSql();
+      const [gate] = await pool.query(
+        `SELECT id FROM orders
+         WHERE id = ? AND factura_token = ? AND ${win.clause} LIMIT 1`,
+        [parseInt(orderId, 10), token, ...win.params]
+      ) as [Array<unknown>, unknown];
+      if (!gate?.length) {
+        // Fallo de acceso (token malo / fuera de ventana / folio inexistente): cuenta igual.
+        registerAccessFailure(ip, sucursal, parseInt(orderId, 10));
+        notFound(); return;
+      }
+      // Token válido → reset INMEDIATO. El 409 dup y el 422 de forma de pago de abajo NO
+      // cuentan como fallo de acceso.
+      resetAccessFailures(ip, sucursal, parseInt(orderId, 10));
+    }
+
     const [orderCheck] = await pool.query(
       "SELECT id, payment_method FROM orders WHERE id = ? LIMIT 1", [parseInt(orderId, 10)]
     ) as [Array<Record<string, any>>, unknown];

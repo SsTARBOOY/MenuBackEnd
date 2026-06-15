@@ -64,7 +64,9 @@ const solicitarHits = new Map<string, { count: number; resetAt: number }>();
 const SOLICITAR_MAX = Number(process.env.SOLICITAR_RATE_MAX ?? "5");
 const SOLICITAR_WINDOW_MS = Number(process.env.SOLICITAR_RATE_WINDOW_MS ?? String(3_600_000));
 
-function clientIp(req: Request): string {
+// Exportada para reutilizarla en el controlador (misma lógica de IP que el rate-limit;
+// depende de app.set("trust proxy", 1) en index.ts para no confiar en X-Forwarded-For falso).
+export function clientIp(req: Request): string {
   return req.ip || req.socket.remoteAddress || "unknown";
 }
 
@@ -86,4 +88,90 @@ export function solicitarRateLimit(req: Request, res: Response, next: NextFuncti
   }
   entry.count++;
   next();
+}
+
+// ── Lockout por FALLOS para el código del ticket (GA) ──────────────────────────
+// Defensa que sostiene la seguridad del código corto (8 chars ≈ 40 bits). Se cuentan
+// SOLO los fallos (código equivocado/ausente en el camino cliente); el éxito limpia.
+//
+//   • PRINCIPAL — por IP: frena la fuerza bruta desde una fuente.
+//   • SECUNDARIO — por folio: MUY suave y CORTO. Acota un ataque DISTRIBUIDO sobre un
+//     mismo folio sin habilitar un DoS dirigido fácil: el bloqueo es de minutos (se
+//     autocura) y quien lo provoca desde una IP se auto-bloquea por IP antes.
+//
+// Umbrales PRO usuario no técnico (toleran errores de tecleo, bloqueos cortos) y
+// env-configurables. Cota de fuerza bruta documentada en el spec del token:
+//   peor caso (ataque distribuido sostenido 24h sobre 1 folio) ≈ FOLIO_MAX fallos por
+//   bloqueo → ~8 cada 5 min ⇒ ~2.3k intentos/24h ⇒ P ≈ 2.7×10⁻⁹ (orden ~1e-9); en la
+//   práctica mucho menor por el throttle por IP y porque el código expira en 24h.
+//
+// ⚠️ En memoria: válido con UNA instancia (Coolify actual). Con réplicas, el lock por
+//    folio se evade rotando instancias → requiere store compartido (Redis/tabla). Ver spec.
+type LockEntry = { fails: number; windowEndsAt: number; blockedUntil: number };
+const accessAttempts = new Map<string, LockEntry>();
+
+const IP_MAX_FAILS     = Number(process.env.FACT_IP_MAX_FAILS     ?? "15");
+const IP_WINDOW_MS     = Number(process.env.FACT_IP_WINDOW_MS     ?? String(10 * 60_000));
+const IP_BLOCK_MS      = Number(process.env.FACT_IP_BLOCK_MS      ?? String(5 * 60_000));
+const FOLIO_MAX_FAILS  = Number(process.env.FACT_FOLIO_MAX_FAILS  ?? "8");
+const FOLIO_WINDOW_MS  = Number(process.env.FACT_FOLIO_WINDOW_MS  ?? String(10 * 60_000));
+const FOLIO_BLOCK_MS   = Number(process.env.FACT_FOLIO_BLOCK_MS   ?? String(5 * 60_000));
+
+const ipKey    = (ip: string): string => `ip:${ip}`;
+const folioKey = (sucursal: string, folio: number | string): string => `folio:${sucursal}:${folio}`;
+
+// Barrido perezoso para que el Map no crezca sin límite (atiende el backlog del leak).
+let lastSweep = 0;
+function sweepAccess(now: number): void {
+  if (now - lastSweep < 5 * 60_000) return;
+  lastSweep = now;
+  for (const [k, e] of accessAttempts) {
+    if (e.blockedUntil <= now && e.windowEndsAt <= now) accessAttempts.delete(k);
+  }
+}
+
+function bumpFailure(key: string, maxFails: number, windowMs: number, blockMs: number, now: number): void {
+  let e = accessAttempts.get(key);
+  if (!e || e.windowEndsAt <= now) {
+    e = { fails: 0, windowEndsAt: now + windowMs, blockedUntil: 0 };
+    accessAttempts.set(key, e);
+  }
+  e.fails += 1;
+  if (e.fails >= maxFails) {
+    e.blockedUntil  = now + blockMs;   // bloqueo temporal corto
+    e.fails         = 0;               // ventana fresca al expirar
+    e.windowEndsAt  = now + blockMs + windowMs;
+  }
+}
+
+function blockedUntilOf(key: string, now: number): number {
+  const e = accessAttempts.get(key);
+  return e && e.blockedUntil > now ? e.blockedUntil : 0;
+}
+
+// Llamar ANTES de tocar la BD. Si está bloqueado (por IP o por folio) → el controlador
+// responde 429 genérico ("demasiados intentos") sin revelar si el folio existe.
+export function checkAccessLock(
+  ip: string, sucursal: string, folio: number | string,
+): { blocked: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  sweepAccess(now);
+  const until = Math.max(
+    blockedUntilOf(ipKey(ip), now),
+    blockedUntilOf(folioKey(sucursal, folio), now),
+  );
+  return { blocked: until > now, retryAfterSec: until > now ? Math.ceil((until - now) / 1000) : 0 };
+}
+
+// Registrar un intento FALLIDO (código equivocado/ausente en el camino cliente).
+export function registerAccessFailure(ip: string, sucursal: string, folio: number | string): void {
+  const now = Date.now();
+  bumpFailure(ipKey(ip),               IP_MAX_FAILS,    IP_WINDOW_MS,    IP_BLOCK_MS,    now);
+  bumpFailure(folioKey(sucursal, folio), FOLIO_MAX_FAILS, FOLIO_WINDOW_MS, FOLIO_BLOCK_MS, now);
+}
+
+// Éxito (código correcto): limpia los contadores de esa IP y ese folio.
+export function resetAccessFailures(ip: string, sucursal: string, folio: number | string): void {
+  accessAttempts.delete(ipKey(ip));
+  accessAttempts.delete(folioKey(sucursal, folio));
 }
