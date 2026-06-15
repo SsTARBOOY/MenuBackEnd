@@ -166,14 +166,42 @@ export async function validarReceptorSat(
   }
 }
 
+// ── IVA: EXTRAER, no sumar (precios con IVA incluido) ────────────
+// Decisión confirmada por el contador (2026-06-15): el precio de la orden YA INCLUYE
+// el IVA = exactamente lo que pagó el cliente en caja. El CFDI lo EXTRAE, NUNCA lo suma:
+//   base  = precioConIva / 1.16            (subtotal/Importe, sin IVA)
+//   iva   = precioConIva − base            (exacto a 2 decimales; base + iva = precioConIva)
+//   total = precioConIva                   (= el precio de la orden, NO × 1.16)
+// Ej.: $200 → base $172.41 + IVA $27.59 = TOTAL $200.00.
+//
+// Cuadre EXACTO: como cada línea aporta su precioConIva al Total, la suma de líneas =
+// SUM(order_items.price) = orders.total → el Total del CFDI cuadra al centavo con caja.
+// Tolerancia SAT por concepto: |iva − base·0.16| = |precioConIva − base·1.16| ≤ 0.0058
+// (porque |base − precioConIva/1.16| ≤ 0.005), siempre < 0.01 → válido en CFDI 4.0.
+export function extraerIva(precioConIva: number): { base: number; iva: number; total: number } {
+  const total = Number(precioConIva.toFixed(2));
+  const base  = Number((total / 1.16).toFixed(2));
+  const iva   = Number((total - base).toFixed(2));
+  return { base, iva, total };
+}
+
 // ── Crear CFDI 4.0 (Ingreso) ────────────────────────────────────
 export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
   const items = data.items.map((it, idx) => {
-    const unitPrice = Number(it.unitPrice.toFixed(6));
-    const subtotal = Number(it.subtotal.toFixed(2));
-    const ivaBase = subtotal;
-    const ivaTotal = Number((ivaBase * 0.16).toFixed(2));
-    const total = Number((subtotal + ivaTotal).toFixed(2));
+    // it.subtotal = importe de la línea (order_items.price), CON IVA incluido.
+    const { base, iva, total } = extraerIva(it.subtotal);
+    // ValorUnitario también SIN IVA, para que Importe = round(ValorUnitario × Cantidad).
+    // Guardia (cantidad > 1): garantiza round(VU × Cant, 2) === base (consistencia que el
+    // SAT valida por concepto). Si el redondeo a 6 decimales no reprodujera la base exacta,
+    // ajusta el ValorUnitario el epsilon mínimo. base/iva/total NO cambian → el Total sigue
+    // cuadrando al centavo con orders.total.
+    let unitPrice = Number((base / it.quantity).toFixed(6));
+    if (Number((unitPrice * it.quantity).toFixed(2)) !== base) {
+      for (const eps of [1e-6, -1e-6, 2e-6, -2e-6]) {
+        const cand = Number((unitPrice + eps).toFixed(6));
+        if (Number((cand * it.quantity).toFixed(2)) === base) { unitPrice = cand; break; }
+      }
+    }
 
     return {
       ProductCode: "90101500",
@@ -183,13 +211,13 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
       UnitCode: "H87",
       UnitPrice: unitPrice,
       Quantity: it.quantity,
-      Subtotal: subtotal,
+      Subtotal: base,
       TaxObject: "02",
       Taxes: [
         {
-          Total: ivaTotal,
+          Total: iva,
           Name: "IVA",
-          Base: ivaBase,
+          Base: base,
           Rate: 0.16,
           IsRetention: false,
         },
