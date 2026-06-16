@@ -1,0 +1,16 @@
+# Harness de prueba LOCAL de la migración. Levanta MariaDB 11.8.6 efímera (sin PII real).
+# Uso (desde esta carpeta):  ./run-test.sh
+services:
+  db:
+    image: mariadb:11.8.6
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpw
+      MARIADB_DATABASE: testdb
+    command: ["--log-bin-trust-function-creators=1"]   # permite crear la función no-determinista
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "3307:3306"   # 3307 host para no chocar con un MySQL local
