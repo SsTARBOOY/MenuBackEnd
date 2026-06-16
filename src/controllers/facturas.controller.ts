@@ -393,25 +393,29 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     ) as [Array<Record<string, any>>, unknown];
 
     // ── 3. Pre-validación del receptor contra el SAT (Grupo F) ────
-    // Fail-open: si no se puede verificar (endpoint desactivado/caído) se procede a timbrar.
-    const validacion = await validarReceptorSat({
-      rfc: rfc.toUpperCase(),
-      name: razonSocial,
-      regimenFiscal,
-      codigoPostal,
-    });
-    if (validacion.verificado && !validacion.valido) {
-      // NO se timbra y NO se deja la orden trabada: se cancela para permitir reintento.
-      await pool.query(
-        `UPDATE factura_requests SET status = 'cancelada', notas = ? WHERE id = ?`,
-        ["pre-validacion SAT no superada", solicitudId]
-      ).catch(() => {});
-      res.status(422).json({
-        ok: false, error: "validacion_receptor", solicitudId, reintentable: true,
-        message: "Tus datos fiscales no coinciden con el padrón del SAT. Verifica que tu RFC, nombre, régimen fiscal y código postal sean idénticos a tu Constancia de Situación Fiscal.",
-        detail: validacion.motivo ?? null,
+    // Fail-open: si no se puede verificar (endpoint apagado/caído) se procede a timbrar.
+    // Se SALTA para público en general (XAXX): sus datos son genéricos, no van al padrón.
+    if (!esPublico) {
+      const validacion = await validarReceptorSat({
+        rfc: rfc.toUpperCase(),
+        name: razonSocial,
+        regimenFiscal,
+        codigoPostal,
       });
-      return;
+      if (validacion.verificado && !validacion.valido) {
+        // Variante (b): solo llega aquí si el RFC no existe/está inactivo en el SAT.
+        // NO se timbra y NO se deja la orden trabada: se cancela para permitir reintento.
+        await pool.query(
+          `UPDATE factura_requests SET status = 'cancelada', notas = ? WHERE id = ?`,
+          ["pre-validacion SAT: RFC inexistente", solicitudId]
+        ).catch(() => {});
+        res.status(422).json({
+          ok: false, error: "validacion_receptor", solicitudId, reintentable: true,
+          message: "No pudimos validar tu RFC con el SAT: no aparece registrado o activo. Verifica que esté escrito tal cual tu Constancia de Situación Fiscal.",
+          detail: validacion.motivo ?? null,
+        });
+        return;
+      }
     }
 
     // ── 4. Timbrar con Facturama ──────────────────────────────

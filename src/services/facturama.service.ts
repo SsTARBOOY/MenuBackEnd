@@ -247,12 +247,19 @@ export function parseCfdiNotas(notas: string | null | undefined): { uuid: string
   return { uuid, cfdiId };
 }
 
-// ── Grupo F: pre-validación del receptor contra el SAT (scaffold fail-open) ──
-// ⚠️ La API de Facturama no expone (en la skill /cfdi-facturama) un endpoint
-// confirmado de validación contra la lista de RFC inscritos (LCO). Hasta
-// confirmarlo, esta función queda DESACTIVADA por env y devuelve verificado=false
-// (fail-open): el llamador debe proceder a timbrar con normalidad.
-// Para activarla: FACTURAMA_VALIDATE_ENABLED=true + FACTURAMA_VALIDATE_URL=<endpoint real>.
+// ── Grupo F: pre-validación del receptor contra el SAT ───────────────────────────
+// Endpoint REAL de Facturama (confirmado en docs 2026-06): POST /customers/validate
+//   Request:  { Rfc, Name, ZipCode, FiscalRegime }
+//   Response: { Rfc, ExistRfc, MatchName, MatchZipCode, MatchFiscalRegime }  (booleanos)
+// Avisa ANTES de timbrar si el RFC del receptor no existe en el SAT, en vez del rechazo
+// críptico del PAC. Política:
+//   • ENV-GATED: apagado salvo FACTURAMA_VALIDATE_ENABLED=true (URL override opcional).
+//   • FAIL-OPEN: ante error/caída/timeout NO bloquea el timbrado (verificado=false); loguea.
+//   • VARIANTE (b): BLOQUEA solo si ExistRfc=false. Nombre/CP/Régimen que no cuadran son
+//     ADVERTENCIA no bloqueante (se loguea y se procede; el PAC es el muro final).
+//   • El llamador SALTA esta validación para público en general (XAXX).
+// ⚠️ Posible costo: la consulta de RFC de Facturama puede consumir 1 folio (como el
+//    timbrado). Por eso va env-gated. Confirmar consumo con Facturama antes de activar.
 export interface ReceptorValidationInput {
   rfc: string;
   name: string;
@@ -262,7 +269,7 @@ export interface ReceptorValidationInput {
 export interface ReceptorValidationResult {
   valido: boolean;
   verificado: boolean;   // false => no se pudo verificar; NO bloquear el timbrado
-  motivo?: string;
+  motivo?: string;       // detalle accionable: qué campo no coincide con el SAT
 }
 
 export async function validarReceptorSat(
@@ -271,18 +278,48 @@ export async function validarReceptorSat(
   if (process.env.FACTURAMA_VALIDATE_ENABLED !== "true") {
     return { valido: true, verificado: false };
   }
-  const base = process.env.FACTURAMA_VALIDATE_URL;
-  if (!base) return { valido: true, verificado: false };
+  const url = process.env.FACTURAMA_VALIDATE_URL ?? `${API_URL}/customers/validate`;
 
   try {
-    const url = `${base}?rfc=${encodeURIComponent(input.rfc)}`;
-    const res = await facturamaFetch(url, { headers: { Authorization: getAuth() } });
-    if (!res.ok) return { valido: true, verificado: false }; // fail-open ante error del endpoint
-    const data = await res.json() as { valid?: boolean; isValid?: boolean; message?: string };
-    const valido = Boolean(data?.valid ?? data?.isValid);
-    return { valido, verificado: true, motivo: valido ? undefined : (data?.message ?? "RFC/Nombre no validado por el SAT") };
-  } catch {
-    return { valido: true, verificado: false }; // fail-open ante caída/timeout
+    const res = await facturamaFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: getAuth() },
+      body: JSON.stringify({
+        Rfc:          input.rfc.toUpperCase(),
+        // Mismo normalizado (MAYÚSCULAS + espacios, conserva acentos) que el timbrado.
+        Name:         normalizeReceiverName(input.name),
+        ZipCode:      input.codigoPostal,
+        FiscalRegime: input.regimenFiscal,
+      }),
+    });
+    // FAIL-OPEN ante cualquier respuesta no-2xx (el PAC igual caza el error al timbrar).
+    if (!res.ok) {
+      console.warn(`[Facturama] validador receptor HTTP ${res.status} — fail-open`);
+      return { valido: true, verificado: false };
+    }
+    const data = await res.json() as {
+      ExistRfc?: boolean; MatchName?: boolean; MatchZipCode?: boolean; MatchFiscalRegime?: boolean;
+    };
+
+    // Variante (b): SOLO el RFC inexistente/inactivo BLOQUEA (es inequívoco). El padrón
+    // del SAT no es 100% fiable para Nombre/CP/Régimen (p. ej. razón social con/sin
+    // régimen de capital), así que esos NO bloquean: se dejan pasar al timbrado y el PAC
+    // es el muro final. Las discrepancias se LOGUEAN (sin PII: solo los nombres de campo).
+    if (data.ExistRfc === false) {
+      return { valido: false, verificado: true, motivo: "tu RFC no aparece registrado o activo en el SAT" };
+    }
+    const advert: string[] = [];
+    if (data.MatchName === false)         advert.push("nombre/razón social");
+    if (data.MatchZipCode === false)      advert.push("código postal");
+    if (data.MatchFiscalRegime === false) advert.push("régimen fiscal");
+    if (advert.length) {
+      console.warn(`[Facturama] pre-validación: el SAT no confirma ${advert.join(", ")} — se procede a timbrar (advertencia no bloqueante)`);
+    }
+    return { valido: true, verificado: true };
+  } catch (e: any) {
+    // FAIL-OPEN ante caída/timeout de red: loguear y proceder a timbrar.
+    console.warn("[Facturama] validador receptor no disponible — fail-open:", e?.name ?? "error");
+    return { valido: true, verificado: false };
   }
 }
 
