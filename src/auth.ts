@@ -4,7 +4,8 @@
 //  Reutiliza el MISMO esquema JWT HS256 que ya valida index.ts y que
 //  emite la capa PHP (api/config.php createToken): firma base64 sobre
 //  `${header}.${payload}` con TOKEN_SECRET, payload con { sub, rol, exp }.
-//  TODO: unificar verifyToken de index.ts con este archivo (qa-fixer).
+//  ÚNICA fuente de verifyToken del backend: index.ts (comentarios/reseñas) y el
+//  controlador de facturas importan ESTE. Se eliminó la copia débil de index.ts.
 // ─────────────────────────────────────────────────────────────────
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";

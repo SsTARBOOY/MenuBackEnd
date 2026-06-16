@@ -314,51 +314,74 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       resetAccessFailures(ip, sucursal, parseInt(orderId, 10));
     }
 
-    const [orderCheck] = await pool.query(
-      "SELECT id, payment_method FROM orders WHERE id = ? LIMIT 1", [parseInt(orderId, 10)]
-    ) as [Array<Record<string, any>>, unknown];
-    if (!orderCheck?.length) { res.status(404).json({ error: "Orden no encontrada." }); return; }
-
-    const [dup] = await pool.query(
-      `SELECT id FROM factura_requests
-       WHERE order_id = ? AND status IN ('pendiente','procesada') LIMIT 1`,
-      [orderId]
-    ) as [Array<unknown>, unknown];
-    if (dup?.length) {
-      res.status(409).json({ error: "Ya existe una solicitud activa para esta orden." }); return;
-    }
-
-    // ── Forma de pago: resolver ANTES de crear la solicitud para no dejar
-    // registros colgados. Si no se puede determinar → 422 (NUNCA 201).
-    const formaPago = resolveFormaPago(orderCheck[0].payment_method ?? null, formaPagoBody);
-    if (formaPago === null) {
-      res.status(422).json({
-        ok: false, error: "forma_pago_requerida", reintentable: true,
-        message: "Indica la forma de pago con la que cubriste tu consumo para poder emitir tu factura.",
-        detail: null,
-      });
-      return;
-    }
-
-    // Público general (XAXX): normaliza a los valores forzados por el SAT para que el
-    // registro y el CFDI sean consistentes (el servicio los vuelve a forzar como defensa
-    // en profundidad, también en el camino admin /timbrar).
+    // Público general (XAXX): valores forzados por el SAT (no dependen de la orden).
+    // El servicio los vuelve a forzar como defensa en profundidad (camino admin /timbrar).
     const esPublico = rfc.toUpperCase() === RFC_PUBLICO_GENERAL;
     const razonEf   = esPublico ? PUBLICO_GENERAL.name          : razonSocial.trim();
     const regimenEf = esPublico ? PUBLICO_GENERAL.regimenFiscal : regimenFiscal;
     const usoEf     = esPublico ? PUBLICO_GENERAL.usoCfdi        : usoCfdi;
     const cpEf      = esPublico ? (process.env.FACTURAMA_CP ?? "76000") : codigoPostal;
+    const oid       = parseInt(orderId, 10);
 
-    // ── 1. Guardar solicitud ──────────────────────────────────
-    const [result] = await pool.query(
-      `INSERT INTO factura_requests
-         (order_id, rfc, razon_social, regimen_fiscal, codigo_postal, uso_cfdi, email)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [parseInt(orderId, 10), rfc.toUpperCase(), razonEf,
-       regimenEf, cpEf, usoEf, email.toLowerCase().trim()]
-    ) as [import("mysql2").ResultSetHeader, unknown];
+    // ── Sección ATÓMICA: bloqueo de la orden (FOR UPDATE) + check-dup + INSERT en UNA
+    // transacción con conexión dedicada. Serializa dos requests concurrentes del MISMO
+    // folio: el segundo espera el lock, ve la solicitud ya insertada y recibe 409 — sin
+    // duplicar el CFDI ni dejar trabadas. La llamada a Facturama queda FUERA de la
+    // transacción (es lenta/externa y no debe sostener un lock de BD).
+    // ⚠️ Requiere InnoDB en `orders` (FOR UPDATE es no-op en MyISAM). Defensa adicional
+    //    recomendada para la VENTANA: UNIQUE index parcial en factura_requests(order_id)
+    //    para los estados activos (cambio de esquema) — anotado para Oscar.
+    let solicitudId = 0;
+    let formaPago = "";
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
 
-    const solicitudId = result.insertId;
+      const [orderLock] = await conn.query(
+        "SELECT id, payment_method FROM orders WHERE id = ? LIMIT 1 FOR UPDATE", [oid]
+      ) as [Array<Record<string, any>>, unknown];
+      if (!orderLock?.length) {
+        await conn.rollback();
+        res.status(404).json({ error: "Orden no encontrada." }); return;
+      }
+
+      const [dup] = await conn.query(
+        `SELECT id FROM factura_requests
+         WHERE order_id = ? AND status IN ('pendiente','procesada') LIMIT 1`, [oid]
+      ) as [Array<unknown>, unknown];
+      if (dup?.length) {
+        await conn.rollback();
+        res.status(409).json({ error: "Ya existe una solicitud activa para esta orden." }); return;
+      }
+
+      // Forma de pago: resolver ANTES del INSERT para no dejar registros colgados.
+      const fp = resolveFormaPago(orderLock[0].payment_method ?? null, formaPagoBody);
+      if (fp === null) {
+        await conn.rollback();
+        res.status(422).json({
+          ok: false, error: "forma_pago_requerida", reintentable: true,
+          message: "Indica la forma de pago con la que cubriste tu consumo para poder emitir tu factura.",
+          detail: null,
+        });
+        return;
+      }
+      formaPago = fp;
+
+      const [ins] = await conn.query(
+        `INSERT INTO factura_requests
+           (order_id, rfc, razon_social, regimen_fiscal, codigo_postal, uso_cfdi, email)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [oid, rfc.toUpperCase(), razonEf, regimenEf, cpEf, usoEf, email.toLowerCase().trim()]
+      ) as [import("mysql2").ResultSetHeader, unknown];
+
+      await conn.commit();
+      solicitudId = ins.insertId;
+    } catch (txErr) {
+      try { await conn.rollback(); } catch { /* la conexión pudo morir; el catch externo responde 500 */ }
+      throw txErr;
+    } finally {
+      conn.release();
+    }
 
     // ── 2. Obtener items para timbrar ─────────────────────────
     // (La orden y su forma de pago ya se resolvieron arriba; no se reconsulta.)

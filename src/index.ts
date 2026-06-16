@@ -7,6 +7,8 @@ import mysql from "mysql2/promise";
 import { pool } from "./db.js";
 import { googleReviewsRouter } from "./googleReviews.js";
 import facturasRouter from "./routes/facturas.route.js";
+// verifyToken UNIFICADO: única implementación endurecida (HS256, timingSafeEqual, fail-closed).
+import { verifyToken } from "./auth.js";
 
 const app = express();
 
@@ -71,8 +73,6 @@ app.use("/api/facturas", facturasRouter);
 const STATIC_BASE_URL = (process.env.STATIC_BASE_URL ?? "").replace(/\/$/, "");
 
 // ==================== POOL DB USUARIOS ====================
-import crypto from "crypto";
-
 const USERS_DB_CONFIGURED = !!(
   process.env.USERS_DB_HOST &&
   process.env.USERS_DB_USER &&
@@ -99,25 +99,9 @@ if (!USERS_DB_CONFIGURED) {
 }
 
 // ── Helpers JWT ──────────────────────────────────────────────
-const TOKEN_SECRET = process.env.TOKEN_SECRET ?? "";
-
-function verifyToken(token: string): { sub: number; rol: string } | null {
-  try {
-    const [header, payload, sig] = token.split(".");
-    if (!header || !payload || !sig) return null;
-    const expected = crypto
-      .createHmac("sha256", TOKEN_SECRET)
-      .update(`${header}.${payload}`)
-      .digest("base64");
-    if (expected !== sig) return null;
-    const data = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
-    if (!data || data.exp < Math.floor(Date.now() / 1000)) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
-
+// Se eliminó la copia DÉBIL de verifyToken que vivía aquí (comparaba la firma con `!==`,
+// sin timing-safe y sin fail-closed). Ahora se usa la ÚNICA implementación endurecida
+// importada de auth.ts. Misma firma HS256 que emite la capa PHP (api/config.php).
 function getAuthUser(req: express.Request, res: express.Response): { sub: number; rol: string } | null {
   const auth = req.headers.authorization ?? "";
   if (!auth.startsWith("Bearer ")) {

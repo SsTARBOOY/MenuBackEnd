@@ -324,7 +324,9 @@ export async function crearCfdi(data: CfdiRequest): Promise<CfdiResult> {
     }
 
     return {
-      ProductCode: "90101500",
+      // c_ClaveProdServ SAT 90101501 "Restaurantes" (servicio a mesa) — confirmado por
+      // legal-fiscal. Una sola clave para todo el ticket (alimentos + bebidas) es lo estándar.
+      ProductCode: "90101501",
       IdentificationNumber: String(idx + 1).padStart(3, "0"),
       Description: it.dishName,
       Unit: "Pieza",
