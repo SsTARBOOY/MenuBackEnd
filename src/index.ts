@@ -1,3 +1,5 @@
+import "./instrument.js";          // PRIMERO: init de Sentry antes de cualquier otro módulo
+import * as Sentry from "@sentry/node";
 import express from "express";
 import cors from "cors";
 import path from "path";
@@ -117,8 +119,16 @@ function getAuthUser(req: express.Request, res: express.Response): { sub: number
 }
 // =============================================================
 
+// Coolify inyecta el SHA del commit desplegado como SOURCE_COMMIT (con fallbacks).
+// Permite verificar que el container corre el commit pusheado (container == HEAD).
+const DEPLOYED_COMMIT =
+  process.env.SOURCE_COMMIT ??
+  process.env.GIT_COMMIT_SHA ??
+  process.env.COMMIT_SHA ??
+  null;
+
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, uploadsDir: UPLOADS_DIR });
+  res.json({ ok: true, uploadsDir: UPLOADS_DIR, commit: DEPLOYED_COMMIT });
 });
 
 // ==================== GALLERY COMMENTS ====================
@@ -345,6 +355,11 @@ app.get("/api/products", async (_req, res) => {
     res.status(500).json({ message: "Error leyendo productos" });
   }
 });
+
+// Captura de errores de Express en Sentry: DESPUÉS de las rutas, ANTES del error
+// handler propio (Sentry captura y delega con next(err) → el handler de abajo responde).
+// Inerte si Sentry no tiene DSN.
+Sentry.setupExpressErrorHandler(app);
 
 // ── Global error handler ────────────────────────────────────────────────────
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
