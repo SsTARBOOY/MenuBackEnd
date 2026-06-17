@@ -22,12 +22,12 @@ Aplica IGUAL a las dos BD: `u522428285_ordenar` (Guerrero) y `u522428285_maderoO
 ## 1. Respaldo OBLIGATORIO antes de aplicar (mysqldump)
 ```bash
 # Guerrero
-mysqldump -h srv1250.hstgr.io -u u522428285_admin -p \
+mysqldump -h <DB_HOST> -u <DB_ADMIN_USER> -p \
   --single-transaction --routines --triggers --events --hex-blob \
   u522428285_ordenar > backup_ordenar_$(date +%F_%H%M).sql
 
 # Madero
-mysqldump -h srv1250.hstgr.io -u u522428285_admin -p \
+mysqldump -h <DB_HOST> -u <DB_ADMIN_USER> -p \
   --single-transaction --routines --triggers --events --hex-blob \
   u522428285_maderoOrdenar > backup_madero_$(date +%F_%H%M).sql
 ```
@@ -35,8 +35,8 @@ mysqldump -h srv1250.hstgr.io -u u522428285_admin -p \
 
 ## 2. Aplicar (con el cliente, NO con un driver)
 ```bash
-mariadb -h srv1250.hstgr.io -u u522428285_admin -p u522428285_ordenar       < migration.sql
-mariadb -h srv1250.hstgr.io -u u522428285_admin -p u522428285_maderoOrdenar < migration.sql
+mariadb -h <DB_HOST> -u <DB_ADMIN_USER> -p u522428285_ordenar       < migration.sql
+mariadb -h <DB_HOST> -u <DB_ADMIN_USER> -p u522428285_maderoOrdenar < migration.sql
 ```
 O subir el `.sql` en **phpMyAdmin → Importar** (entiende `DELIMITER`).
 
