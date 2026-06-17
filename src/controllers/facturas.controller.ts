@@ -22,6 +22,7 @@ import {
   registerAccessFailure,
   resetAccessFailures,
 } from "../auth.js";
+import { notifyOwner } from "../services/notify.js";
 
 const parseSucursal = (val: unknown): Sucursal | null => {
   if (val === "guerrero" || val === "madero") return val;
@@ -458,19 +459,33 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       });
 
     } catch (factuErr: any) {
-      // Grupo B: NO dejar la orden trabada. Se revierte a 'cancelada' para permitir reintento.
+      // Motivo REAL del PAC (sin PII): se PERSISTE para diagnóstico/remediación y se alerta a Oscar.
+      const tipo    = factuErr?.name ?? "Error";
+      const esCaida = factuErr instanceof FacturamaUnavailableError;
+      const detalle = (factuErr instanceof FacturamaRejectionError || factuErr instanceof FacturamaUnavailableError)
+        ? factuErr.detail : (factuErr?.message ?? "error");
+
+      // Grupo B: NO dejar la orden trabada → 'cancelada' (reintentable), guardando el motivo real.
       await pool.query(
         `UPDATE factura_requests SET status = 'cancelada', notas = ? WHERE id = ?`,
-        [`timbrado fallido: ${factuErr?.name ?? "error"}`, solicitudId]
+        [`timbrado fallido [${tipo}]: ${String(detalle).slice(0, 180)}`, solicitudId]
       ).catch(() => { /* no enmascarar el error original */ });
 
       // Grupo H: log SIN PII — solo solicitudId + tipo de error + detalle recortado.
-      const detalle = (factuErr instanceof FacturamaRejectionError || factuErr instanceof FacturamaUnavailableError)
-        ? factuErr.detail : (factuErr?.message ?? "error");
-      console.error(`[facturas] timbrado fallido solicitud=${solicitudId} tipo=${factuErr?.name ?? "Error"} detalle=${String(detalle).slice(0, 200)}`);
+      console.error(`[facturas] timbrado fallido solicitud=${solicitudId} tipo=${tipo} detalle=${String(detalle).slice(0, 200)}`);
+
+      // Alerta fail-soft a Oscar (Telegram): infra caída → siempre (dedup corto); rechazo → 1/folio/día.
+      void notifyOwner(
+        `⚠️ Timbrado falló · ${sucursal} · folio ${String(orderId).padStart(6, "0")} · sol#${solicitudId}\n` +
+        `tipo: ${tipo}${esCaida ? " (servicio caído)" : ""}\n` +
+        `motivo: ${String(detalle).slice(0, 200)}`,
+        esCaida
+          ? { dedupKey: `down:${sucursal}`,             dedupMs: 30 * 60 * 1000 }
+          : { dedupKey: `rej:${sucursal}:${orderId}`,   dedupMs: 24 * 60 * 60 * 1000 }
+      );
 
       // Grupo C: devolver el error REAL y accionable con código correcto (nunca 201 success).
-      if (factuErr instanceof FacturamaUnavailableError) {
+      if (esCaida) {
         res.status(503).json({
           ok: false, error: "facturama_no_disponible", solicitudId, reintentable: true,
           message: "El servicio de facturación no está disponible en este momento. Tu orden NO quedó bloqueada; vuelve a intentarlo en unos minutos.",
@@ -580,9 +595,21 @@ export const timbrarFactura = async (req: Request, res: Response): Promise<void>
 
   } catch (err: any) {
     // Grupo H: log SIN PII. La solicitud queda en 'pendiente' para que admin reintente.
+    const tipo    = err?.name ?? "Error";
     const detalle = (err instanceof FacturamaRejectionError || err instanceof FacturamaUnavailableError)
       ? err.detail : (err?.message ?? "error");
-    console.error(`[facturas] timbrarFactura fallido solicitud=${solicitudId} tipo=${err?.name ?? "Error"} detalle=${String(detalle).slice(0, 200)}`);
+    console.error(`[facturas] timbrarFactura fallido solicitud=${solicitudId} tipo=${tipo} detalle=${String(detalle).slice(0, 200)}`);
+
+    // Persistir el motivo REAL (mantiene 'pendiente' para reintento de admin) + alerta a Oscar.
+    await pool.query(
+      `UPDATE factura_requests SET notas = ? WHERE id = ?`,
+      [`timbrado fallido [${tipo}]: ${String(detalle).slice(0, 180)}`, solicitudId]
+    ).catch(() => { /* fail-soft: no enmascarar el error original */ });
+    void notifyOwner(
+      `⚠️ Re-timbrado (admin) falló · ${sucursal} · sol#${solicitudId}\n` +
+      `tipo: ${tipo}\nmotivo: ${String(detalle).slice(0, 200)}`,
+      { dedupKey: `retimbrar:${sucursal}:${solicitudId}`, dedupMs: 60 * 60 * 1000 }
+    );
 
     // Grupo C: error real y accionable con código correcto.
     if (err instanceof FacturamaUnavailableError) {
