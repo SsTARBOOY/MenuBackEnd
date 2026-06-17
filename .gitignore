@@ -1,4 +1,8 @@
 .env
+.env.test
 node_modules/
 dist/
 tsconfig.tsbuildinfo
+playwright-report/
+test-results/
+playwright/.cache/
