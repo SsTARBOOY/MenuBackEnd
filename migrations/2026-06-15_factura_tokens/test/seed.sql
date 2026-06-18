@@ -1,6 +1,18 @@
 -- seed.sql — Esquema SINTÉTICO (sin PII real) que reproduce las columnas relevantes de las
 -- BD de La Peña, con filas PREEXISTENTES (sin factura_token) para probar el backfill.
 -- Se carga ANTES de migration.sql.
+--
+-- ╔════════════════════════════════════════════════════════════════════════════════════╗
+-- ║  ⛔  ¡ALTO!  ESTE SEED HACE  DROP TABLE  +  CREATE TABLE.                              ║
+-- ║      Es SOLO para el harness Docker EFÍMERO (run-test.sh, BD 'testdb').                ║
+-- ║      NUNCA lo pegues en phpMyAdmin ni lo corras contra Hostinger / prod / testOrdenar. ║
+-- ║      Para sembrar testOrdenar usa el INSERT-ONLY:  server/tests/e2e/seed.sql           ║
+-- ╚════════════════════════════════════════════════════════════════════════════════════╝
+--
+-- GUARD anti-paste: aborta salvo en la BD efímera 'testdb'. Si DATABASE() <> 'testdb', el subquery
+-- escalar devuelve 2 filas → ERROR 1242 ("Subquery returns more than 1 row") y el script SE DETIENE
+-- ANTES de cualquier DROP (independiente de sql_mode). En el harness ('testdb') devuelve NULL y sigue.
+SELECT (SELECT 1 FROM (SELECT 1 UNION SELECT 2) g WHERE DATABASE() <> 'testdb') AS _abortar_si_no_es_testdb;
 
 SET NAMES utf8mb4;
 
