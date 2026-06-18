@@ -15,6 +15,8 @@ Aplica IGUAL a las dos BD: `u522428285_ordenar` (Guerrero) y `u522428285_maderoO
 ## Archivos
 - `migration.sql` — la migración.
 - `rollback.sql` — revierte todo (additive → seguro).
+- `RUNBOOK_PROD.md` — **procedimiento de producción** (respaldo → precheck → migración → assert → POS, Guerrero luego Madero). **Empieza por aquí para aplicar en prod.**
+- `phpmyadmin/` — precheck/assert + variantes `*_show.sql` (sin `information_schema`) para la pestaña SQL.
 - `test/` — harness Docker + verificación del algoritmo + aserciones.
 
 ---
@@ -49,10 +51,11 @@ mariadb ... u522428285_maderoOrdenar < rollback.sql
 ---
 
 ## ⚠️ Caveats de Hostinger (revisar antes de correr en prod)
-- **Privilegios:** se necesitan `ALTER`, `INDEX`, `CREATE ROUTINE`, `TRIGGER`. El usuario suele tenerlos sobre su propia BD; si no, pedir al hosting.
-- **`log_bin_trust_function_creators`:** si el binlog está activo, crear la función no-determinista puede requerir esta opción (o `SUPER`). El harness de prueba ya la activa. Si Hostinger lo bloquea → **alternativa**: generar el token desde la app (Node) al crear la orden y NO instalar la función/trigger (los pasos 1, 4, 5, 6 siguen aplicando).
+- **Privilegios:** se necesitan `ALTER`, `INDEX`, `CREATE ROUTINE`, `TRIGGER`. ✅ Confirmados en `testOrdenar` y prod (función + trigger se crean sin error).
+- **`log_bin_trust_function_creators`:** la función se declara `NOT DETERMINISTIC NO SQL`, lo que evita el error 1418 y **no** requiere esta opción ni `SUPER` aunque el binlog esté activo. ✅ Confirmado en Hostinger.
+- **Fallback si algún día el hosting bloqueara rutinas/triggers — degrada DENTRO de la BD, NO hacia Node.** El POS escribe las órdenes **directo a la BD** y lee el token de vuelta para imprimirlo; Node solo *lee* `orders`, no está en el camino de escritura, así que "generar el token desde Node" **no cubriría** esas órdenes. Escalera correcta: (1) inline el generador en el trigger sin `CREATE FUNCTION`; (2) si tampoco hay triggers, columna `CHAR(8) DEFAULT (expr con RANDOM_BYTES)` (solo `ALTER`). Un barrido por cron **NO** sirve como fuente: el ticket se imprime al instante del INSERT y saldría sin token.
 - **`RANDOM_BYTES`** requiere MariaDB ≥ 10.10 (11.8.6 ✓).
-- **Paso 6 (UNIQUE de solicitud activa):** si ya existen **duplicados activos** del bug de carrera viejo, el `ADD UNIQUE` falla. El script trae un **PRECHECK** que los lista. Remediar las trabadas/fantasmas primero y **re-ejecutar** (es idempotente).
+- **Paso 6 (UNIQUE de solicitud activa):** si ya existen **duplicados activos** del bug de carrera viejo, el `ADD UNIQUE` falla. El script trae un **PRECHECK** que los lista. Remediar las trabadas/fantasmas primero y **re-ejecutar** (es idempotente). ✅ Precheck corrido en prod (2026-06-17): **0 duplicados activos** en Guerrero (46) y Madero (8) → entra limpio.
 
 ---
 
@@ -64,5 +67,8 @@ cd test && ./run-test.sh
 Levanta MariaDB 11.8.6 efímera, siembra un esquema **sintético (sin PII)**, aplica la migración, corre aserciones, prueba el bloqueo de duplicado activo, la **idempotencia** (2ª corrida) y el **rollback**, y limpia.
 
 ### Estado de la verificación en esta entrega
-- ✅ **Algoritmo del token VERIFICADO** (ejecutado): `node test/verify-token-algo.mjs` — 500k tokens sin colisión, distribución uniforme (Chi²≈25 ≪ 59.7), y se demuestra que el rejection sampling elimina el sesgo de módulo (sin él Chi²≈11030).
-- ⚠️ **Ejecución del SQL contra MariaDB: PENDIENTE de correr el harness.** El entorno donde se redactó esto **no tiene Docker/MariaDB/cliente mysql**, por lo que el `.sql` se revisó estáticamente contra la semántica de MariaDB 11.8.6 pero **no se ejecutó aquí**. Corre `test/run-test.sh` en una máquina con Docker para obtener la evidencia de ejecución antes de aplicar en prod.
+- ✅ **Algoritmo del token VERIFICADO** (ejecutado): `node test/verify-token-algo.mjs` — 500k tokens sin colisión, distribución uniforme (Chi²≈36 ≪ 59.7), y se demuestra que el rejection sampling elimina el sesgo de módulo (sin él Chi²≈11030).
+- ✅ **SQL VERIFICADO en `testOrdenar`** (phpMyAdmin, 2026-06-17): migración + backfill + aserciones a1…a8, **rollback limpio** y **re-apply** OK. Función + trigger creados sin error (privilegios Hostinger OK).
+- ✅ **Precheck en prod** (read-only `/db-probe`, 2026-06-17): **0 duplicados activos** en ambas BD → el paso 6 entra limpio.
+- ✅ **AMBAS BD MIGRADAS Y VERIFICADAS en prod** (2026-06-17) — fase de BD **cerrada**. Guerrero: backfill 5141/5141, 0 colisiones. Madero: assert a1–a9 verde + trigger probado en vivo (`HNWD3EAK`).
+- ▶️ **Siguiente (fase de aplicación):** actualizar el POS (read-back + `&t=`) y desplegar el backend nuevo. Ver `.claude/reports/2026-06-17-pos-cambio-readback-token.md` y `.claude/reports/2026-06-17-backend-deploy-plan.md`.
