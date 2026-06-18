@@ -38,10 +38,22 @@ export default async function globalSetup(): Promise<void> {
   for (const key of ["DB_GUERRERO_NAME", "DB_MADERO_NAME"]) {
     if (PROD_DB_NAMES.includes(env[key] ?? "")) fail(`${key}=${env[key]} es una BD de PRODUCCIÓN. Usa una BD de prueba.`);
   }
+  // Excepción OPT-IN (off por default): permite el host de Hostinger SOLO para una BD de
+  // prueba explícita (p. ej. testOrdenar). Requiere ALLOW_HOSTINGER_TESTDB=true Y que el
+  // nombre contenga "test" y NO sea una BD de prod. Sin el flag, el host de prod sigue
+  // bloqueado igual que antes. Mitigación extra: en Hostinger el usuario de testOrdenar
+  // solo puede tocar testOrdenar (grants por BD), así que no alcanza prod.
+  const ALLOW_HOSTINGER_TESTDB = env.ALLOW_HOSTINGER_TESTDB === "true";
   for (const key of ["DB_GUERRERO_HOST", "DB_MADERO_HOST"]) {
-    if ((env[key] ?? "") === PROD_DB_HOST) fail(`${key}=${PROD_DB_HOST} es el host de PRODUCCIÓN. Usa 127.0.0.1/local.`);
-    // Bloquea también el fallback silencioso a prod cuando la var viene vacía.
+    // Bloquea el fallback silencioso a prod cuando la var viene vacía.
     if (!env[key]) fail(`${key} vacío → el pool caería al host de PROD por default. Defínelo a tu BD de prueba.`);
+    if (env[key] === PROD_DB_HOST) {
+      const name = env[key.replace("_HOST", "_NAME")] ?? "";
+      const looksTest = /test/i.test(name) && !PROD_DB_NAMES.includes(name);
+      if (!(ALLOW_HOSTINGER_TESTDB && looksTest)) {
+        fail(`${key}=${PROD_DB_HOST} es el host de PRODUCCIÓN. Solo permitido con ALLOW_HOSTINGER_TESTDB=true y ${key.replace("_HOST", "_NAME")} de prueba (contiene "test", no prod). Actual: ${name || "(vacío)"}.`);
+      }
+    }
   }
 
   // 4) Observabilidad apagada en pruebas (no mandar nada a Sentry/Telegram reales).

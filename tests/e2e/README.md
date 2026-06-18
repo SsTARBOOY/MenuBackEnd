@@ -46,3 +46,15 @@ npm run test:e2e:report                  # abre el reporte HTML
 4. `npm run test:e2e` (re-siembra antes de cada corrida; el seed es idempotente).
 
 Reporte HTML en `playwright-report/` (gitignored).
+
+### Correr contra Hostinger `testOrdenar` (sin MySQL local)
+El guardrail bloquea el host de prod (`srv1250.hstgr.io`) por default. Para usar la BD de prueba
+`testOrdenar` (que vive en ese host) hay una **excepción opt-in**:
+1. En `.env.test`: `ALLOW_HOSTINGER_TESTDB=true`, `E2E_DB=true`, `FACTURAMA_URL=http://127.0.0.1:4555`
+   (mock), y `DB_GUERRERO_*`/`DB_MADERO_*` con las **credenciales propias de testOrdenar**
+   (`DB_*_NAME` debe contener `test`; el usuario de prod no la ve).
+2. Siembra `seed.sql` en `testOrdenar` (rango 990000–990099, aislado de sus datos reales).
+3. `npx playwright test --project=grace`.
+
+El opt-in solo permite el host de prod si `DB_*_NAME` contiene `test` y no es una BD de prod; sin el
+flag, el host de prod sigue bloqueado. (El usuario de testOrdenar solo puede tocar testOrdenar.)
