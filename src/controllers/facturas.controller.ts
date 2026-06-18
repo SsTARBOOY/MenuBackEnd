@@ -83,6 +83,21 @@ const ventanaSql = (): { clause: string; params: Array<number> } => {
   };
 };
 
+// ── Modo de exigencia del token del ticket (control de acceso anti-IDOR, camino cliente) ──
+//   FACT_TOKEN_MODE = "on" (default) | "grace"
+//     "on"    = se EXIGE token: sin token → 404; con token → id+token+ventana.
+//     "grace" = token OPCIONAL durante la transición del POS: si viene se valida igual; si NO
+//               viene, lookup por folio+ventana (comportamiento previo al token). Reabre el IDOR
+//               de folios (= postura ANTERIOR al feature); el lockout sigue activo. Volver a "on"
+//               cuando el POS imprima el QR en ambas sucursales (solo env + reinicio, sin redeploy).
+const TOKEN_REQUIRED = (process.env.FACT_TOKEN_MODE ?? "on").toLowerCase() !== "grace";
+
+// Cláusula SQL del token: se aplica si el modo lo exige O si el cliente mandó token (para
+// validarlo aunque estemos en grace). En grace SIN token: no agrega cláusula (folio+ventana).
+const tokenClause = (token: string): { sql: string; params: string[] } =>
+  (TOKEN_REQUIRED || token) ? { sql: "AND factura_token = ?", params: [token] }
+                            : { sql: "", params: [] };
+
 /* Resuelve la clave SAT c_FormaPago con la que se debe timbrar.
    Prioridad:
      1) selección explícita válida del body (cliente/caja),
@@ -124,7 +139,8 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
     res.status(400).json({ error: "Sucursal requerida (guerrero o madero)." }); return;
   }
   // Cliente: sin token no se abre nada (no se distingue de folio inexistente).
-  if (!isAdmin && !token) { notFound(); return; }
+  // En grace (FACT_TOKEN_MODE=grace) el token es opcional → no se exige aquí.
+  if (!isAdmin && TOKEN_REQUIRED && !token) { notFound(); return; }
 
   // Lockout (solo cliente): si está bloqueado por IP o por folio → 429 ANTES de tocar la BD.
   const ip = clientIp(req);
@@ -148,11 +164,13 @@ export const getOrden = async (req: Request, res: Response): Promise<void> => {
     } else {
       // Cliente: token + ventana (mes natural en curso, por defecto) en UNA consulta →
       // match/no-match indistinguible. Sobre order_date en hora MX (ver ventanaSql).
+      // En grace (FACT_TOKEN_MODE=grace) sin token: cae a folio+ventana (ver tokenClause).
       const win = ventanaSql();
+      const tc  = tokenClause(token);
       [orderRows] = await pool.query(
         `SELECT ${cols} FROM orders
-         WHERE id = ? AND factura_token = ? AND ${win.clause} LIMIT 1`,
-        [orderId, token, ...win.params]
+         WHERE id = ? ${tc.sql} AND ${win.clause} LIMIT 1`,
+        [orderId, ...tc.params, ...win.params]
       ) as [Array<Record<string, any>>, unknown];
     }
 
@@ -284,7 +302,8 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
       error: "No encontramos tu orden. Escanea el QR de tu ticket para facturar.",
     });
   };
-  if (!isAdmin && !token) { notFound(); return; }
+  // Grace (FACT_TOKEN_MODE=grace): token opcional → no se exige aquí.
+  if (!isAdmin && TOKEN_REQUIRED && !token) { notFound(); return; }
 
   // Lockout (solo cliente): si está bloqueado por IP o por folio → 429 ANTES de tocar la BD.
   const ip = clientIp(req);
@@ -300,10 +319,11 @@ export const solicitarFactura = async (req: Request, res: Response): Promise<voi
     // Para el cliente también cierra los oráculos de orderCheck (404) y dup (409) de abajo.
     if (!isAdmin) {
       const win = ventanaSql();
+      const tc  = tokenClause(token);
       const [gate] = await pool.query(
         `SELECT id FROM orders
-         WHERE id = ? AND factura_token = ? AND ${win.clause} LIMIT 1`,
-        [parseInt(orderId, 10), token, ...win.params]
+         WHERE id = ? ${tc.sql} AND ${win.clause} LIMIT 1`,
+        [parseInt(orderId, 10), ...tc.params, ...win.params]
       ) as [Array<unknown>, unknown];
       if (!gate?.length) {
         // Fallo de acceso (token malo / fuera de ventana / folio inexistente): cuenta igual.

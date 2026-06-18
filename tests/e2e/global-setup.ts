@@ -50,4 +50,11 @@ export default async function globalSetup(): Promise<void> {
 
   // eslint-disable-next-line no-console
   console.log(`✅ Guardrail E2E OK · Facturama=${fUrl} · BD=${env.DB_GUERRERO_NAME}/${env.DB_MADERO_NAME}`);
+
+  // Compila el backend UNA sola vez aquí: ambos webServers (project "on" y "grace") arrancan
+  // con `npm run start` desde el MISMO dist → evita dos `tsc` concurrentes en condición de carrera.
+  const { execSync } = await import("node:child_process");
+  // eslint-disable-next-line no-console
+  console.log("⚙️  Compilando backend (tsc) para los webServers on/grace…");
+  execSync("npm run build", { stdio: "inherit" });
 }

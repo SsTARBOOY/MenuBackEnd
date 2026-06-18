@@ -20,6 +20,14 @@ El backend bajo prueba recibe el env de `.env.test` **inyectado** como env real 
 | 1 | Fallo → 422/503 + reintentable | `timbrado-flow.spec.ts` | **sí** |
 | 2 | Reintento NO da 409 | `timbrado-flow.spec.ts` | **sí** |
 | 3 | Timbrado OK → `procesada` + UUID | `timbrado-flow.spec.ts` | **sí** |
+| G | Modo gracia: token opcional en getOrden/solicitar; reobtención sigue estricta | `grace.spec.ts` | reobtención→404: no · sin token→200: **sí** |
+
+## Dos modos del token (projects)
+La suite arranca **dos backends** y los prueba en paralelo lógico (workers=1):
+- **project `on`** (puerto `PORT`, default `4000`): `FACT_TOKEN_MODE` ausente → enforcement. Corre todos los specs **menos** `grace.spec.ts`.
+- **project `grace`** (puerto `PORT+1`): `FACT_TOKEN_MODE=grace`. Corre **solo** `grace.spec.ts`.
+
+El build (`tsc`) se hace UNA vez en `global-setup`; ambos backends arrancan con `npm run start` desde el mismo `dist`. Los casos `grace` con BD (sin token → 200) se **saltan** si `E2E_DB!=true`; los sin BD (reobtención → 404) corren siempre.
 
 Los casos 1–3 y 5(cuerpo) corren contra un **mock determinista** de Facturama (`facturama-mock.mjs`, CERO folios). El happy-path también funciona contra **sandbox real** si pones `FACTURAMA_URL=https://apisandbox.facturama.mx` + credenciales sandbox en `.env.test`.
 
