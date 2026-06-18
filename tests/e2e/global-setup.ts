@@ -38,20 +38,24 @@ export default async function globalSetup(): Promise<void> {
   for (const key of ["DB_GUERRERO_NAME", "DB_MADERO_NAME"]) {
     if (PROD_DB_NAMES.includes(env[key] ?? "")) fail(`${key}=${env[key]} es una BD de PRODUCCIÓN. Usa una BD de prueba.`);
   }
-  // Excepción OPT-IN (off por default): permite el host de Hostinger SOLO para una BD de
-  // prueba explícita (p. ej. testOrdenar). Requiere ALLOW_HOSTINGER_TESTDB=true Y que el
-  // nombre contenga "test" y NO sea una BD de prod. Sin el flag, el host de prod sigue
-  // bloqueado igual que antes. Mitigación extra: en Hostinger el usuario de testOrdenar
-  // solo puede tocar testOrdenar (grants por BD), así que no alcanza prod.
+  // Excepción OPT-IN (off por default) para usar la BD de prueba que vive en el host de
+  // Hostinger (testOrdenar). ALLOWLIST POR NOMBRE EXACTO — no es un patrón ni apaga el
+  // chequeo: solo las BD listadas aquí pasan; cualquier otro nombre en el host de prod se
+  // bloquea. Las BD de prod NO están en la lista (y además se excluyen explícitamente, ver
+  // `!PROD_DB_NAMES.includes`). Sin el flag, el host de prod sigue bloqueado igual que antes.
+  // Mitigación extra: el usuario de testOrdenar en Hostinger solo puede tocar testOrdenar.
+  const TEST_DB_ALLOWLIST = ["u522428285_testOrdenar"]; // ⚠️ confirma/ajusta al nombre EXACTO de tu BD de prueba
   const ALLOW_HOSTINGER_TESTDB = env.ALLOW_HOSTINGER_TESTDB === "true";
   for (const key of ["DB_GUERRERO_HOST", "DB_MADERO_HOST"]) {
+    const nameKey = key.replace("_HOST", "_NAME");
+    const name = env[nameKey] ?? "";
     // Bloquea el fallback silencioso a prod cuando la var viene vacía.
     if (!env[key]) fail(`${key} vacío → el pool caería al host de PROD por default. Defínelo a tu BD de prueba.`);
     if (env[key] === PROD_DB_HOST) {
-      const name = env[key.replace("_HOST", "_NAME")] ?? "";
-      const looksTest = /test/i.test(name) && !PROD_DB_NAMES.includes(name);
-      if (!(ALLOW_HOSTINGER_TESTDB && looksTest)) {
-        fail(`${key}=${PROD_DB_HOST} es el host de PRODUCCIÓN. Solo permitido con ALLOW_HOSTINGER_TESTDB=true y ${key.replace("_HOST", "_NAME")} de prueba (contiene "test", no prod). Actual: ${name || "(vacío)"}.`);
+      // Cinturón y tirantes: nombre en la allowlist EXACTA y, además, jamás un nombre de prod.
+      const allowed = ALLOW_HOSTINGER_TESTDB && TEST_DB_ALLOWLIST.includes(name) && !PROD_DB_NAMES.includes(name);
+      if (!allowed) {
+        fail(`${key}=${PROD_DB_HOST} es el host de PRODUCCIÓN. Solo con ALLOW_HOSTINGER_TESTDB=true y ${nameKey} en la allowlist exacta [${TEST_DB_ALLOWLIST.join(", ")}]. Actual: ${name || "(vacío)"}.`);
       }
     }
   }
