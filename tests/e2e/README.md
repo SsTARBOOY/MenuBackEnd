@@ -6,7 +6,7 @@ Tests de **API** (sin navegador) del flujo crítico de facturación con Playwrig
 `global-setup.ts` **aborta** la corrida si:
 - `ALLOW_E2E != true`
 - `FACTURAMA_URL` apunta a prod (`api.facturama.mx`)
-- la BD es de prod (nombres `u522428285_*` o host `srv1250.hstgr.io`, o vacía → caería a prod por default)
+- la BD es de prod (nombres `u522428285_*` o el host de prod `PROD_DB_HOST`, o vacía → caería a prod por default)
 - hay `SENTRY_DSN` / `NOTIFY_TELEGRAM_TOKEN` (las pruebas no deben emitir a servicios reales)
 
 El backend bajo prueba recibe el env de `.env.test` **inyectado** como env real (precede a cualquier `.env`), y Sentry/Telegram se fuerzan apagados.
@@ -48,7 +48,7 @@ npm run test:e2e:report                  # abre el reporte HTML
 Reporte HTML en `playwright-report/` (gitignored).
 
 ### Correr contra Hostinger `testOrdenar` (sin MySQL local)
-El guardrail bloquea el host de prod (`srv1250.hstgr.io`) por default. Para usar la BD de prueba
+El guardrail bloquea el host de prod (`PROD_DB_HOST`, en global-setup) por default. Para usar la BD de prueba
 `testOrdenar` (que vive en ese host) hay una **excepción opt-in**:
 1. En `.env.test`: `ALLOW_HOSTINGER_TESTDB=true`, `E2E_DB=true`, `FACTURAMA_URL=http://127.0.0.1:4555`
    (mock), y `DB_GUERRERO_*`/`DB_MADERO_*` con un **usuario Hostinger de mínimo privilegio con GRANT
